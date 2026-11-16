@@ -36,10 +36,11 @@ pub unsafe fn stop(hwnd: Handle) {
 /// Generate one high-contrast rotating ring, without retaining GDI handles.
 pub unsafe fn tick(hwnd: Handle) {
     const N: usize = 32;
-    const POINTS: [(i32, i32); 8] = [(16, 4), (24, 8), (28, 16), (24, 24), (16, 28), (8, 24), (4, 16), (8, 8)];
-    // CreateIcon expects an AND mask and bottom-up BGRA color pixels.
+    const POINTS: [(i32, i32); 8] = [(16, 6), (23, 9), (26, 16), (23, 23), (16, 26), (9, 23), (6, 16), (9, 9)];
+    // Preserve the same faded application icon under every frame.
     let mut and_mask = [0xffu8; N * 4];
-    let mut pixels = [0u8; N * N * 4];
+    let Some(mut pixels) = crate::success::faded_icon_pixels() else {return};
+    for y in 0..N {for x in 0..N {if pixels[(y*N+x)*4+3]!=0 {and_mask[y*4+x/8]&=!(0x80>>(x%8));}}}
     let phase = FRAME.fetch_add(1, Ordering::Relaxed) % POINTS.len();
     for (i, &(cx, cy)) in POINTS.iter().enumerate() {
         let strength = ((i + POINTS.len() - phase) % POINTS.len()) as u8;
@@ -47,7 +48,7 @@ pub unsafe fn tick(hwnd: Handle) {
         for y in (cy - 2)..=(cy + 2) {
             for x in (cx - 2)..=(cx + 2) {
                 if (x - cx).pow(2) + (y - cy).pow(2) > 5 { continue; }
-                let row = N - 1 - y as usize;
+                let row = y as usize;
                 let col = x as usize;
                 let at = (row * N + col) * 4;
                 pixels[at..at + 4].copy_from_slice(&[color, color, color, 255]);

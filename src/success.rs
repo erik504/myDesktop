@@ -49,15 +49,25 @@ fn fade_base(pixel:&mut [u8]) {
     for channel in &mut pixel[..3] { *channel=((u16::from(*channel)*alpha+127)/255) as u8; }
     pixel[3]=alpha as u8;
 }
+/// Shared background for all tray status signals, in premultiplied BGRA.
+pub(crate) fn faded_icon_pixels()->Option<[u8;4096]> {
+    let mut pixels=original_pixels()?;
+    for pixel in pixels.chunks_exact_mut(4) {fade_base(pixel);}
+    Some(pixels)
+}
 #[cfg(test)]
 #[test] fn fades_base_to_forty_percent_with_premultiplied_color() {
     let mut white=[255,255,255,255];fade_base(&mut white);assert_eq!(white,[102,102,102,102]);
     let mut invisible=[50,100,200,0];fade_base(&mut invisible);assert_eq!(invisible,[0,0,0,0]);
+    let original=original_pixels().unwrap();let faded=faded_icon_pixels().unwrap();
+    for (before,after) in original.chunks_exact(4).zip(faded.chunks_exact(4)) {
+        let mut expected=[before[0],before[1],before[2],before[3]];fade_base(&mut expected);assert_eq!(after,expected);
+    }
 }
 pub unsafe fn draw(hwnd: Handle) {
     const N: usize=32;
     let mut mask=[0xffu8; N*4];
-    let Some(mut pixels)=original_pixels() else {return};
+    let Some(mut pixels)=faded_icon_pixels() else {return};
     for y in 0..N { for x in 0..N {
         let dx=x as i32-16; let dy=y as i32-16;
         let at=(y*N+x)*4;
@@ -65,7 +75,7 @@ pub unsafe fn draw(hwnd: Handle) {
             let white=(x>=8 && x<=15 && (y as i32-(x as i32+4)).abs()<=2)
                 || (x>=14 && x<=24 && (y as i32-(34-x as i32)).abs()<=2);
             pixels[at..at+4].copy_from_slice(if white {&[255,255,255,255]} else {&[35,135,25,255]});
-        } else {fade_base(&mut pixels[at..at+4]);}
+        }
         if pixels[at+3]!=0 {mask[y*4+x/8]&=!(0x80>>(x%8));}
     }}
     unsafe {

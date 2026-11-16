@@ -43,13 +43,16 @@ pub unsafe fn draw(hwnd:Handle) {
     let mut chars=message.encode_utf16();
     for dst in d.tip.iter_mut().take(127) { if let Some(ch)=chars.next(){*dst=ch}else{break} }
     if state.seen { unsafe{crate::Shell_NotifyIconW(1,&mut d);} return; }
-    let mut mask=[0xffu8;128]; let mut pixels=[0u8;4096];
+    let mut mask=[0xffu8;128]; let Some(mut pixels)=crate::success::faded_icon_pixels() else{return};
     for y in 0..32usize {for x in 0..32usize {
         let dx=x as i32-16; let dy=y as i32-16;
-        if dx*dx+dy*dy>14*14 {continue}
-        let white=(dx-dy).abs()<=2 || (dx+dy).abs()<=2;
-        let color=if white {[255,255,255,255]}else{[35,35,210,255]};
-        let i=(y*32+x)*4; pixels[i..i+4].copy_from_slice(&color);mask[y*4+x/8]&=!(0x80>>(x%8));
+        let i=(y*32+x)*4;
+        if dx*dx+dy*dy<=11*11 {
+            let white=(dx-dy).abs()<=2 || (dx+dy).abs()<=2;
+            let color=if white {[255,255,255,255]}else{[35,35,210,255]};
+            pixels[i..i+4].copy_from_slice(&color);
+        }
+        if pixels[i+3]!=0 {mask[y*4+x/8]&=!(0x80>>(x%8));}
     }}
     unsafe {let icon=CreateIcon(std::ptr::null_mut(),32,32,1,32,mask.as_ptr(),pixels.as_ptr()); if !icon.is_null(){d.icon=icon;crate::Shell_NotifyIconW(1,&mut d);DestroyIcon(icon);}}
 }
