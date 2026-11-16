@@ -40,9 +40,10 @@ fn text(buf: &[u16]) -> String { String::from_utf16_lossy(&buf[..buf.iter().posi
 fn db_path() -> Result<PathBuf,String> { let p=std::env::var_os("APPDATA").ok_or("Cartella APPDATA non disponibile")?; Ok(PathBuf::from(p).join("myDesktop").join("layout.json")) }
 
 #[derive(Clone, Serialize, Deserialize)] struct Monitor { id: String, device: String, rect: Rect, work: Rect, primary: bool }
-#[derive(Clone, Serialize, Deserialize)] struct Window { exe: String, class: String, title: String, folder: Option<String>, monitor_id: String, monitor_device: String, rect: Rect, show: u32 }
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)] struct WindowIdentity { hwnd:u64, pid:u32, created:u64 }
+#[derive(Clone, Serialize, Deserialize)] struct Window { exe: String, class: String, title: String, folder: Option<String>, monitor_id: String, monitor_device: String, rect: Rect, show: u32, #[serde(default)] identity:Option<WindowIdentity> }
 #[derive(Serialize, Deserialize)] struct Layout { version: u32, windows: Vec<Window> }
-struct Live { hwnd: Hwnd, exe: String, class: String, title: String, folder: Option<String>, monitor: isize, rect: Rect, show: u32 }
+#[derive(Clone)] struct Live { hwnd: Hwnd, exe: String, class: String, title: String, folder: Option<String>, monitor: isize, rect: Rect, show: u32, identity:Option<WindowIdentity> }
 
 unsafe fn monitor_data(h: isize) -> Option<Monitor> { unsafe {
     let mut mi: MonitorInfo=zeroed(); mi.size=size_of::<MonitorInfo>() as u32;
@@ -67,7 +68,8 @@ unsafe extern "system" fn window_cb(h:Hwnd,arg:isize)->i32 { unsafe {
     let mut wp:Placement=zeroed(); wp.length=size_of::<Placement>() as u32; if GetWindowPlacement(h,(&mut wp as *mut Placement).cast())==0{return 1}
     let monitor=MonitorFromWindow(h,2); let Some(mi)=monitor_data(monitor) else{return 1};
     let mut r=Rect::default(); if wp.show==1 { GetWindowRect(h,(&mut r as *mut Rect).cast()); } else { r=wp.normal; let dx=mi.work.left-mi.rect.left; let dy=mi.work.top-mi.rect.top; r.left+=dx;r.right+=dx;r.top+=dy;r.bottom+=dy; }
-    (*(arg as *mut Vec<Live>)).push(Live{ hwnd:h,exe,class,title,folder:None,monitor,rect:r,show:wp.show }); 1
+    let identity=crate::ipc::process_created(pid).map(|created|WindowIdentity{hwnd:h as u64,pid,created});
+    (*(arg as *mut Vec<Live>)).push(Live{ hwnd:h,exe,class,title,folder:None,monitor,rect:r,show:wp.show,identity }); 1
 } }
 fn windows()->Result<Vec<Live>,String>{ let mut v:Vec<Live>=Vec::new(); unsafe{EnumWindows(Some(window_cb),&mut v as *mut _ as isize);} let folders=crate::explorer::capture()?; for w in &mut v { w.folder=folders.get(&w.hwnd).cloned(); if w.class=="CabinetWClass" && w.folder.is_none(){return Err(format!("Impossibile leggere la cartella di Esplora file: {}",w.title));} } Ok(v) }
 
@@ -75,7 +77,7 @@ pub fn save()->Result<String,String>{
     save_to(&db_path()?)
 }
 pub fn save_to(path: &Path)->Result<String,String>{
-    let mut out=Vec::new(); for w in windows()?{ if let Some(m)=unsafe{monitor_data(w.monitor)} {out.push(Window{exe:w.exe,class:w.class,title:w.title,folder:w.folder,monitor_id:m.id,monitor_device:m.device,rect:Rect{left:w.rect.left-m.rect.left,top:w.rect.top-m.rect.top,right:w.rect.right-m.rect.left,bottom:w.rect.bottom-m.rect.top},show:w.show});} }
+    let mut out=Vec::new(); for w in windows()?{ if let Some(m)=unsafe{monitor_data(w.monitor)} {out.push(Window{exe:w.exe,class:w.class,title:w.title,folder:w.folder,monitor_id:m.id,monitor_device:m.device,rect:Rect{left:w.rect.left-m.rect.left,top:w.rect.top-m.rect.top,right:w.rect.right-m.rect.left,bottom:w.rect.bottom-m.rect.top},show:w.show,identity:w.identity});} }
     if out.is_empty(){return Err("Nessuna finestra gestibile trovata: configurazione precedente conservata.".into())}
     fs::create_dir_all(path.parent().ok_or("Cartella del file non valida")?).map_err(|e|e.to_string())?;
     let data=serde_json::to_vec_pretty(&Layout{version:1,windows:out}).map_err(|e|e.to_string())?;
@@ -96,20 +98,83 @@ fn write_layout(path: &Path, data: &[u8]) -> Result<(), String> {
 #[cfg(test)] mod tests {
     use super::*;
     fn monitor(id:&str,device:&str,primary:bool)->Monitor{Monitor{id:id.into(),device:device.into(),rect:Rect::default(),work:Rect::default(),primary}}
-    fn saved()->Window{Window{exe:"C:\\App.exe".into(),class:"Class".into(),title:"first".into(),folder:None,monitor_id:"physical-A".into(),monitor_device:"display1".into(),rect:Rect::default(),show:1}}
-    fn live(hwnd:isize,title:&str,folder:Option<&str>)->Live{Live{hwnd,exe:"c:\\app.exe".into(),class:"Class".into(),title:title.into(),folder:folder.map(str::to_owned),monitor:0,rect:Rect::default(),show:1}}
+    fn saved()->Window{Window{exe:"C:\\App.exe".into(),class:"Class".into(),title:"first".into(),folder:None,monitor_id:"physical-A".into(),monitor_device:"display1".into(),rect:Rect::default(),show:1,identity:None}}
+    fn live(hwnd:isize,title:&str,folder:Option<&str>)->Live{Live{hwnd,exe:"c:\\app.exe".into(),class:"Class".into(),title:title.into(),folder:folder.map(str::to_owned),monitor:0,rect:Rect::default(),show:1,identity:None}}
     #[test] fn selects_saved_physical_monitor_and_falls_back_to_primary(){let ms=vec![monitor("physical-B","display1",true),monitor("physical-A","display2",false)];let mut s=saved();assert_eq!(target(&s,&ms).unwrap().device,"display2");s.monitor_id="missing".into();assert_eq!(target(&s,&ms).unwrap().device,"display1");}
     #[test] fn matches_title_and_never_reuses_window(){let s=saved();let a=vec![live(1,"other",None),live(2,"first",None)];let mut used=HashSet::new();assert_eq!(best(&s,&a,&used),Some(2));used.insert(2);assert_eq!(best(&s,&a,&used),Some(1));}
     #[test] fn matches_explorer_folder(){let mut s=saved();s.folder=Some("C:\\folder".into());let a=vec![live(1,"first",Some("C:\\other")),live(2,"other",Some("c:\\FOLDER"))];assert_eq!(best(&s,&a,&HashSet::new()),Some(2));}
     #[test] fn matches_mfc_changed_handles_only_for_same_style_and_title(){let mut s=saved();s.class="Afx:00400000:28:00010007:00000000:00000000".into();let mut w=live(1,"first",None);w.class="Afx:00700000:28:00020007:00000000:00000000".into();assert!(matches(&s,&w));w.title="another".into();assert!(!matches(&s,&w));w.title="first".into();w.class="Afx:00700000:29:00020007:00000000:00000000".into();assert!(!matches(&s,&w));}
     #[test] fn exact_class_match_outranks_mfc_fallback(){let mut s=saved();s.class="Afx:00400000:28:00010007:00000000:00000000".into();let mut a=live(1,"first",None);a.class="Afx:00700000:28:00020007:00000000:00000000".into();let mut b=live(2,"first",None);b.class=s.class.clone();assert_eq!(best(&s,&[a,b],&HashSet::new()),Some(2));}
     #[test] fn mfc_fallback_requires_same_executable_and_valid_class(){let mut s=saved();s.class="Afx:00400000:28:00010007:00000000:00000000".into();let mut w=live(1,"first",None);w.class="Afx:00700000:28:00020007:00000000:00000000".into();w.exe="C:\\Another.exe".into();assert!(!matches(&s,&w));w.exe=s.exe.clone();w.class="Afx:00700000:28:broken".into();assert!(!matches(&s,&w));}
+    fn chrome_saved(title:&str,id:Option<WindowIdentity>)->Window{let mut w=saved();w.exe="C:\\Chrome\\chrome.exe".into();w.class="Chrome_WidgetWin_1".into();w.title=title.into();w.identity=id;w}
+    fn chrome_live(hwnd:isize,title:&str,id:Option<WindowIdentity>)->Live{let mut w=live(hwnd,title,None);w.exe="C:\\Chrome\\chrome.exe".into();w.class="Chrome_WidgetWin_1".into();w.identity=id;w}
+    fn id(hwnd:u64,created:u64)->WindowIdentity{WindowIdentity{hwnd,pid:42,created}}
+    #[test] fn chrome_reordered_and_changed_titles_keep_their_own_handles(){
+        let saved=vec![chrome_saved("Prima",Some(id(10,123))),chrome_saved("Seconda",Some(id(20,123)))];
+        let live=vec![chrome_live(20,"Seconda",Some(id(20,123))),chrome_live(10,"Nuova scheda",Some(id(10,123)))];
+        assert_eq!(plan_matches(&saved,&live,&HashSet::new()),vec![Some(10),Some(20)]);
+    }
+    #[test] fn chrome_missing_title_does_not_steal_other_saved_window(){
+        let saved=vec![chrome_saved("Prima",None),chrome_saved("Seconda",None)];
+        let live=vec![chrome_live(20,"Seconda",None),chrome_live(30,"Altra",None)];
+        assert_eq!(plan_matches(&saved,&live,&HashSet::new()),vec![None,Some(20)]);
+    }
+    #[test] fn chrome_duplicate_titles_are_not_guessed(){
+        let saved=vec![chrome_saved("Scheda",None),chrome_saved("Scheda",None)];
+        let live=vec![chrome_live(10,"Scheda",None),chrome_live(20,"Scheda",None)];
+        assert_eq!(plan_matches(&saved,&live,&HashSet::new()),vec![None,None]);
+    }
+    #[test] fn old_layouts_read_without_window_identity(){
+        let mut json=serde_json::to_value(saved()).unwrap();json.as_object_mut().unwrap().remove("identity");
+        assert!(serde_json::from_value::<Window>(json).unwrap().identity.is_none());
+    }
+    #[test] fn recycled_process_identity_is_not_trusted(){
+        let saved=vec![chrome_saved("Vecchia",Some(id(10,123)))];
+        let live=vec![chrome_live(10,"Diversa",Some(id(10,456)))];
+        assert_eq!(plan_matches(&saved,&live,&HashSet::new()),vec![None]);
+    }
+    #[test] #[ignore = "read-only check against currently open Chrome windows"]
+    fn real_chrome_windows_keep_their_identity_when_order_and_title_change(){
+        let mut observed:Vec<Live>=Vec::new();unsafe{EnumWindows(Some(window_cb),&mut observed as *mut _ as isize);}
+        let mut chrome:Vec<Live>=observed.into_iter().filter(|w|is_chrome(&w.exe)&&w.identity.is_some()).collect();
+        assert!(chrome.len()>=2,"Servono almeno due finestre Chrome identificabili");
+        let saved:Vec<Window>=chrome.iter().map(|w|Window{exe:w.exe.clone(),class:w.class.clone(),title:w.title.clone(),folder:None,monitor_id:String::new(),monitor_device:String::new(),rect:w.rect,show:w.show,identity:w.identity.clone()}).collect();
+        chrome.reverse();chrome[0].title.push_str(" - titolo modificato nella prova");
+        let actual=plan_matches(&saved,&chrome,&HashSet::new());
+        let expected:Vec<_>=saved.iter().map(|w|w.identity.as_ref().map(|id|id.hwnd as isize)).collect();
+        assert_eq!(actual,expected);
+    }
     #[test] fn named_layout_writes_selected_file_and_preserves_other_file(){let dir=std::env::temp_dir().join(format!("mydesktop-layout-test-{}-{:?}",std::process::id(),std::thread::current().id()));fs::create_dir(&dir).unwrap();let a=dir.join("first.json");let b=dir.join("second.json");write_layout(&a,b"first").unwrap();write_layout(&b,b"second").unwrap();write_layout(&a,b"updated").unwrap();assert_eq!(fs::read(&a).unwrap(),b"updated");assert_eq!(fs::read(&b).unwrap(),b"second");fs::remove_file(a).unwrap();fs::remove_file(b).unwrap();fs::remove_dir(dir).unwrap();}
 }
 fn equivalent(a:&str,b:&str)->bool{a.eq_ignore_ascii_case(b)}
 fn mfc_style(class:&str)->Option<&str>{ let mut fields=class.split(':'); if fields.next()? != "Afx" {return None} let instance=fields.next()?; let style=fields.next()?; let cursor=fields.next()?; let background=fields.next()?; let icon=fields.next()?; if fields.next().is_some() || [instance,style,cursor,background,icon].iter().any(|s|s.is_empty() || !s.bytes().all(|c|c.is_ascii_hexdigit())) {return None} Some(style) }
 fn matches(saved:&Window,live:&Live)->bool { equivalent(&saved.exe,&live.exe) && (saved.class==live.class || (saved.title==live.title && mfc_style(&saved.class).is_some_and(|s|mfc_style(&live.class).is_some_and(|v|s.eq_ignore_ascii_case(v))))) && match &saved.folder {Some(folder)=>live.folder.as_ref().is_some_and(|f|equivalent(folder,f)),None=>true} }
 fn best(saved:&Window, live:&[Live],used:&HashSet<Hwnd>)->Option<Hwnd>{ live.iter().filter(|w|!used.contains(&w.hwnd)&&matches(saved,w)).max_by_key(|w|(w.title==saved.title,w.class==saved.class)).map(|w|w.hwnd) }
+fn is_chrome(exe:&str)->bool { Path::new(exe).file_name().is_some_and(|name|name.to_string_lossy().eq_ignore_ascii_case("chrome.exe")) }
+/// Reserve all confident matches before allowing weaker matches to consume windows.
+fn plan_matches(saved:&[Window],live:&[Live],used:&HashSet<Hwnd>)->Vec<Option<Hwnd>> {
+    let mut result=vec![None;saved.len()];let mut reserved=used.clone();
+    // Handles only count when the owning process and its creation time also match.
+    for (i,s) in saved.iter().enumerate() {
+        let Some(id)=s.identity.as_ref() else{continue};
+        if let Some(w)=live.iter().find(|w|!reserved.contains(&w.hwnd)&&w.identity.as_ref()==Some(id)&&matches(s,w)) {result[i]=Some(w.hwnd);reserved.insert(w.hwnd);}
+    }
+    // Exact titles are assigned globally before any fallback, so a changed title
+    // cannot steal another saved window. Ambiguous Chrome titles are not guessed.
+    for (i,s) in saved.iter().enumerate() {
+        if result[i].is_some(){continue}
+        let candidates:Vec<_>=live.iter().filter(|w|!reserved.contains(&w.hwnd)&&matches(s,w)&&w.title==s.title).collect();
+        if is_chrome(&s.exe) {
+            let competing=saved.iter().enumerate().filter(|(j,other)|result[*j].is_none()&&is_chrome(&other.exe)&&equivalent(&s.exe,&other.exe)&&s.class==other.class&&s.title==other.title).count();
+            if candidates.len()!=1 || competing!=1 {continue}
+        }
+        if let Some(w)=candidates.first(){result[i]=Some(w.hwnd);reserved.insert(w.hwnd);}
+    }
+    for (i,s) in saved.iter().enumerate() {
+        if result[i].is_none() && !is_chrome(&s.exe) {if let Some(h)=best(s,live,&reserved){result[i]=Some(h);reserved.insert(h);}}
+    }
+    result
+}
 fn launch_application(exe:&str)->Result<(),String>{
     let mut command=Command::new(exe);
     if let Some(parent)=Path::new(exe).parent(){command.current_dir(parent);}
@@ -160,7 +225,7 @@ fn actual_window_is_untouched_then_moves_smoothly() {
         assert_ne!(crate::RegisterClassW(&class),0);
         let window=crate::CreateWindowExW(0,name.as_ptr(),name.as_ptr(),0,40,40,200,100,null_mut(),null_mut(),instance,null_mut());assert!(!window.is_null());let hwnd=window as isize;
         let mut rect=Rect::default();assert_ne!(GetWindowRect(hwnd,(&mut rect as *mut Rect).cast()),0);
-        let live=Live{hwnd,exe:String::new(),class:String::new(),title:String::new(),folder:None,monitor:0,rect,show:1};
+        let live=Live{hwnd,exe:String::new(),class:String::new(),title:String::new(),folder:None,monitor:0,rect,show:1,identity:None};
         CHANGES.store(0,Ordering::SeqCst);place_window(hwnd,&live,rect,1).unwrap();assert_eq!(CHANGES.load(Ordering::SeqCst),0);
         let goal=Rect{left:rect.left+20,right:rect.right+20,..rect};let start=std::time::Instant::now();place_window(hwnd,&live,goal,1).unwrap();
         assert!(start.elapsed()>=Duration::from_millis(450));let mut actual=Rect::default();assert_ne!(GetWindowRect(hwnd,(&mut actual as *mut Rect).cast()),0);assert_eq!(actual,goal);assert!(CHANGES.load(Ordering::SeqCst)>1);
@@ -206,12 +271,17 @@ pub fn restore()->Result<String,String>{
 pub fn restore_from(path: &Path)->Result<String,String>{
     let data=fs::read(path).map_err(|e|format!("Impossibile leggere la configurazione salvata: {e}"))?; let layout:Layout=serde_json::from_slice(&data).map_err(|e|format!("Configurazione non valida: {e}"))?; if layout.version!=1{return Err("Versione della configurazione non supportata.".into())}
     let monitors=monitors(); if monitors.is_empty(){return Err("Nessun monitor disponibile.".into())}
-    let mut used=HashSet::new(); let mut succeeded=0; let mut failed=Vec::new();
-    for s in &layout.windows {
-        let mut current=windows()?; let mut found=best(s,&current,&used);
+    let mut used=HashSet::new(); let mut succeeded=0; let mut failed=Vec::new();let mut chrome_launches=HashSet::new();
+    for (index,s) in layout.windows.iter().enumerate() {
+        let mut current=windows()?; let mut found=plan_matches(&layout.windows[index..],&current,&used)[0];
         if found.is_none(){
+            // Chrome cannot reconstruct a specific window's tabs from its title.
+            // Never launch another instance when other Chrome windows are present.
+            if is_chrome(&s.exe) && (current.iter().any(|w|equivalent(&s.exe,&w.exe)) || !chrome_launches.insert(s.exe.to_lowercase())) {
+                failed.push(format!("{} (finestra Chrome non identificabile con certezza)",s.title));continue;
+            }
             let launched=if let Some(folder)=&s.folder{crate::explorer::launch(folder).map_err(|e|e.to_string())}else{launch_application(&s.exe)};
-            match launched { Ok(())=>{for _ in 0..30{thread::sleep(Duration::from_millis(300));current=windows()?;found=best(s,&current,&used);if found.is_some(){break}}}, Err(error)=>{failed.push(format!("{} ({error})",s.title));continue;} }
+            match launched { Ok(())=>{for _ in 0..30{thread::sleep(Duration::from_millis(300));current=windows()?;found=plan_matches(&layout.windows[index..],&current,&used)[0];if found.is_some(){break}}}, Err(error)=>{failed.push(format!("{} ({error})",s.title));continue;} }
         }
         if let Some(h)=found { used.insert(h); let m=target(s,&monitors).unwrap(); let r=s.rect; let mut x=m.rect.left+r.left; let mut y=m.rect.top+r.top; let mut width=(r.right-r.left).max(1); let mut height=(r.bottom-r.top).max(1); let same=if s.monitor_id.is_empty(){m.device.eq_ignore_ascii_case(&s.monitor_device)}else{m.id.eq_ignore_ascii_case(&s.monitor_id)}; if !same {width=width.min(m.work.right-m.work.left);height=height.min(m.work.bottom-m.work.top);x=x.clamp(m.work.left,m.work.right-width);y=y.clamp(m.work.top,m.work.bottom-height);} let desired=Rect{left:x,top:y,right:x+width,bottom:y+height}; if let Some(live)=current.iter().find(|w|w.hwnd==h) {match place_window(h,live,desired,s.show){Ok(())=>succeeded+=1,Err(error)=>failed.push(format!("{} ({error})",s.title))}} else {failed.push(s.title.clone())} } else {failed.push(s.title.clone())}
     }

@@ -81,6 +81,7 @@ fn same_session_accepts_different_uac_logons_but_not_other_users_or_sessions() {
 }
 fn current()->Result<Identity,String>{unsafe{identity(token(GetCurrentProcess())?.0)}}
 fn process_identity(pid:u32)->Result<(Owned,Identity,u64),String>{unsafe{let p=open_process(pid)?;let id=identity(token(p.0)?.0)?;let(mut c,mut e,mut k,mut u)=(FileTime::default(),FileTime::default(),FileTime::default(),FileTime::default());if GetProcessTimes(p.0,&mut c,&mut e,&mut k,&mut u)==0{return Err(last("identità processo non leggibile"))}let created=(u64::from(c.high)<<32)|u64::from(c.low);Ok((p,id,created))}}
+pub(crate) fn process_created(pid:u32)->Option<u64>{process_identity(pid).ok().map(|(_,_,created)|created)}
 fn process_path(p:Handle)->Result<String,String>{unsafe{let mut b=vec![0u16;32768];let mut n=b.len() as u32;if QueryFullProcessImageNameW(p,0,b.as_mut_ptr(),&mut n)==0{return Err(last("percorso processo non leggibile"))}Ok(String::from_utf16_lossy(&b[..n as usize]))}}
 fn installed_path()->Result<String,String>{unsafe{let mut p=[0u16;260];if SHGetFolderPathW(null_mut(),0x26,null_mut(),0,p.as_mut_ptr())!=0{return Err("Cartella Programmi non disponibile".into())}let n=p.iter().position(|x|*x==0).ok_or("Percorso Programmi non valido")?;Ok(format!("{}\\myDesktop\\myDesktop.exe",String::from_utf16_lossy(&p[..n])))}}
 fn pipe_name(session:u32)->Vec<u16>{wide(&format!(r"\\.\pipe\myDesktop-WindowMover-v1-{session}"))}
