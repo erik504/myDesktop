@@ -101,10 +101,10 @@ fn write_layout(path: &Path, data: &[u8]) -> Result<(), String> {
     fn saved()->Window{Window{exe:"C:\\App.exe".into(),class:"Class".into(),title:"first".into(),folder:None,monitor_id:"physical-A".into(),monitor_device:"display1".into(),rect:Rect::default(),show:1,identity:None}}
     fn live(hwnd:isize,title:&str,folder:Option<&str>)->Live{Live{hwnd,exe:"c:\\app.exe".into(),class:"Class".into(),title:title.into(),folder:folder.map(str::to_owned),monitor:0,rect:Rect::default(),show:1,identity:None}}
     #[test] fn selects_saved_physical_monitor_and_falls_back_to_primary(){let ms=vec![monitor("physical-B","display1",true),monitor("physical-A","display2",false)];let mut s=saved();assert_eq!(target(&s,&ms).unwrap().device,"display2");s.monitor_id="missing".into();assert_eq!(target(&s,&ms).unwrap().device,"display1");}
-    #[test] fn matches_title_and_never_reuses_window(){let s=saved();let a=vec![live(1,"other",None),live(2,"first",None)];let mut used=HashSet::new();assert_eq!(best(&s,&a,&used),Some(2));used.insert(2);assert_eq!(best(&s,&a,&used),Some(1));}
-    #[test] fn matches_explorer_folder(){let mut s=saved();s.folder=Some("C:\\folder".into());let a=vec![live(1,"first",Some("C:\\other")),live(2,"other",Some("c:\\FOLDER"))];assert_eq!(best(&s,&a,&HashSet::new()),Some(2));}
+    #[test] fn matches_title_and_never_reuses_window(){let s=saved();let a=vec![live(1,"other",None),live(2,"first",None)];let mut used=HashSet::new();assert_eq!(plan_matches(&[s.clone()],&a,&used),vec![Some(2)]);used.insert(2);assert_eq!(plan_matches(&[s],&a,&used),vec![None]);}
+    #[test] fn matches_explorer_folder(){let mut s=saved();s.folder=Some("C:\\folder".into());let a=vec![live(1,"first",Some("C:\\other")),live(2,"first",Some("c:\\FOLDER"))];assert_eq!(plan_matches(&[s],&a,&HashSet::new()),vec![Some(2)]);}
     #[test] fn matches_mfc_changed_handles_only_for_same_style_and_title(){let mut s=saved();s.class="Afx:00400000:28:00010007:00000000:00000000".into();let mut w=live(1,"first",None);w.class="Afx:00700000:28:00020007:00000000:00000000".into();assert!(matches(&s,&w));w.title="another".into();assert!(!matches(&s,&w));w.title="first".into();w.class="Afx:00700000:29:00020007:00000000:00000000".into();assert!(!matches(&s,&w));}
-    #[test] fn exact_class_match_outranks_mfc_fallback(){let mut s=saved();s.class="Afx:00400000:28:00010007:00000000:00000000".into();let mut a=live(1,"first",None);a.class="Afx:00700000:28:00020007:00000000:00000000".into();let mut b=live(2,"first",None);b.class=s.class.clone();assert_eq!(best(&s,&[a,b],&HashSet::new()),Some(2));}
+    #[test] fn identical_titles_without_identity_are_not_guessed_even_for_mfc(){let mut s=saved();s.class="Afx:00400000:28:00010007:00000000:00000000".into();let mut a=live(1,"first",None);a.class="Afx:00700000:28:00020007:00000000:00000000".into();let mut b=live(2,"first",None);b.class=s.class.clone();assert_eq!(plan_matches(&[s],&[a,b],&HashSet::new()),vec![None]);}
     #[test] fn mfc_fallback_requires_same_executable_and_valid_class(){let mut s=saved();s.class="Afx:00400000:28:00010007:00000000:00000000".into();let mut w=live(1,"first",None);w.class="Afx:00700000:28:00020007:00000000:00000000".into();w.exe="C:\\Another.exe".into();assert!(!matches(&s,&w));w.exe=s.exe.clone();w.class="Afx:00700000:28:broken".into();assert!(!matches(&s,&w));}
     fn chrome_saved(title:&str,id:Option<WindowIdentity>)->Window{let mut w=saved();w.exe="C:\\Chrome\\chrome.exe".into();w.class="Chrome_WidgetWin_1".into();w.title=title.into();w.identity=id;w}
     fn chrome_live(hwnd:isize,title:&str,id:Option<WindowIdentity>)->Live{let mut w=live(hwnd,title,None);w.exe="C:\\Chrome\\chrome.exe".into();w.class="Chrome_WidgetWin_1".into();w.identity=id;w}
@@ -133,6 +133,24 @@ fn write_layout(path: &Path, data: &[u8]) -> Result<(), String> {
         let live=vec![chrome_live(10,"Diversa",Some(id(10,456)))];
         assert_eq!(plan_matches(&saved,&live,&HashSet::new()),vec![None]);
     }
+    #[test] fn different_applications_reserve_titles_and_never_steal_windows(){
+        for exe in [r"C:\Firefox\firefox.exe",r"C:\Sublime Text\sublime_text.exe",r"C:\New App\future.exe"] {
+            let mut a=saved();a.exe=exe.into();a.title="Documento A".into();
+            let mut b=a.clone();b.title="Documento B".into();
+            let mut wa=live(10,"Titolo cambiato",None);wa.exe=exe.into();
+            let mut wb=live(20,"Documento B",None);wb.exe=exe.into();
+            assert_eq!(plan_matches(&[a,b],&[wa,wb],&HashSet::new()),vec![None,Some(20)]);
+        }
+    }
+    #[test] fn generic_duplicate_titles_are_not_guessed(){
+        let saved=vec![saved(),saved()];let open=vec![live(1,"first",None),live(2,"first",None)];
+        assert_eq!(plan_matches(&saved,&open,&HashSet::new()),vec![None,None]);
+    }
+    #[test] fn explorer_unique_folder_matches_even_if_title_changes(){
+        let mut s=saved();s.folder=Some(r"C:\Folder".into());
+        let open=vec![live(10,"Titolo diverso",Some(r"c:\folder")),live(20,"first",Some(r"C:\Other"))];
+        assert_eq!(plan_matches(&[s],&open,&HashSet::new()),vec![Some(10)]);
+    }
     #[test] #[ignore = "read-only check against currently open Chrome windows"]
     fn real_chrome_windows_keep_their_identity_when_order_and_title_change(){
         let mut observed:Vec<Live>=Vec::new();unsafe{EnumWindows(Some(window_cb),&mut observed as *mut _ as isize);}
@@ -149,8 +167,7 @@ fn write_layout(path: &Path, data: &[u8]) -> Result<(), String> {
 fn equivalent(a:&str,b:&str)->bool{a.eq_ignore_ascii_case(b)}
 fn mfc_style(class:&str)->Option<&str>{ let mut fields=class.split(':'); if fields.next()? != "Afx" {return None} let instance=fields.next()?; let style=fields.next()?; let cursor=fields.next()?; let background=fields.next()?; let icon=fields.next()?; if fields.next().is_some() || [instance,style,cursor,background,icon].iter().any(|s|s.is_empty() || !s.bytes().all(|c|c.is_ascii_hexdigit())) {return None} Some(style) }
 fn matches(saved:&Window,live:&Live)->bool { equivalent(&saved.exe,&live.exe) && (saved.class==live.class || (saved.title==live.title && mfc_style(&saved.class).is_some_and(|s|mfc_style(&live.class).is_some_and(|v|s.eq_ignore_ascii_case(v))))) && match &saved.folder {Some(folder)=>live.folder.as_ref().is_some_and(|f|equivalent(folder,f)),None=>true} }
-fn best(saved:&Window, live:&[Live],used:&HashSet<Hwnd>)->Option<Hwnd>{ live.iter().filter(|w|!used.contains(&w.hwnd)&&matches(saved,w)).max_by_key(|w|(w.title==saved.title,w.class==saved.class)).map(|w|w.hwnd) }
-fn is_chrome(exe:&str)->bool { Path::new(exe).file_name().is_some_and(|name|name.to_string_lossy().eq_ignore_ascii_case("chrome.exe")) }
+#[cfg(test)] fn is_chrome(exe:&str)->bool { Path::new(exe).file_name().is_some_and(|name|name.to_string_lossy().eq_ignore_ascii_case("chrome.exe")) }
 /// Reserve all confident matches before allowing weaker matches to consume windows.
 fn plan_matches(saved:&[Window],live:&[Live],used:&HashSet<Hwnd>)->Vec<Option<Hwnd>> {
     let mut result=vec![None;saved.len()];let mut reserved=used.clone();
@@ -159,19 +176,23 @@ fn plan_matches(saved:&[Window],live:&[Live],used:&HashSet<Hwnd>)->Vec<Option<Hw
         let Some(id)=s.identity.as_ref() else{continue};
         if let Some(w)=live.iter().find(|w|!reserved.contains(&w.hwnd)&&w.identity.as_ref()==Some(id)&&matches(s,w)) {result[i]=Some(w.hwnd);reserved.insert(w.hwnd);}
     }
-    // Exact titles are assigned globally before any fallback, so a changed title
-    // cannot steal another saved window. Ambiguous Chrome titles are not guessed.
+    // Explorer can be recognized by its saved folder even when its title changes.
+    for (i,s) in saved.iter().enumerate() {
+        if result[i].is_some()||s.folder.is_none(){continue}
+        let candidates:Vec<_>=live.iter().filter(|w|!reserved.contains(&w.hwnd)&&matches(s,w)).collect();
+        if candidates.len()!=1 {continue} let w=candidates[0];
+        let competing=saved.iter().enumerate().filter(|(j,other)|result[*j].is_none()&&other.folder.is_some()&&matches(other,w)).count();
+        if competing==1 {result[i]=Some(w.hwnd);reserved.insert(w.hwnd);}
+    }
+    // Exact titles are assigned only where the pairing is unambiguous. In
+    // Explorer, matches() also compares the saved folder.
     for (i,s) in saved.iter().enumerate() {
         if result[i].is_some(){continue}
         let candidates:Vec<_>=live.iter().filter(|w|!reserved.contains(&w.hwnd)&&matches(s,w)&&w.title==s.title).collect();
-        if is_chrome(&s.exe) {
-            let competing=saved.iter().enumerate().filter(|(j,other)|result[*j].is_none()&&is_chrome(&other.exe)&&equivalent(&s.exe,&other.exe)&&s.class==other.class&&s.title==other.title).count();
-            if candidates.len()!=1 || competing!=1 {continue}
-        }
-        if let Some(w)=candidates.first(){result[i]=Some(w.hwnd);reserved.insert(w.hwnd);}
-    }
-    for (i,s) in saved.iter().enumerate() {
-        if result[i].is_none() && !is_chrome(&s.exe) {if let Some(h)=best(s,live,&reserved){result[i]=Some(h);reserved.insert(h);}}
+        if candidates.len()!=1 {continue}
+        let w=candidates[0];
+        let competing=saved.iter().enumerate().filter(|(j,other)|result[*j].is_none()&&other.title==w.title&&matches(other,w)).count();
+        if competing==1 {result[i]=Some(w.hwnd);reserved.insert(w.hwnd);}
     }
     result
 }
@@ -271,14 +292,15 @@ pub fn restore()->Result<String,String>{
 pub fn restore_from(path: &Path)->Result<String,String>{
     let data=fs::read(path).map_err(|e|format!("Impossibile leggere la configurazione salvata: {e}"))?; let layout:Layout=serde_json::from_slice(&data).map_err(|e|format!("Configurazione non valida: {e}"))?; if layout.version!=1{return Err("Versione della configurazione non supportata.".into())}
     let monitors=monitors(); if monitors.is_empty(){return Err("Nessun monitor disponibile.".into())}
-    let mut used=HashSet::new(); let mut succeeded=0; let mut failed=Vec::new();let mut chrome_launches=HashSet::new();
+    let mut used=HashSet::new(); let mut succeeded=0; let mut failed=Vec::new();let mut launched_exes=HashSet::new();
     for (index,s) in layout.windows.iter().enumerate() {
         let mut current=windows()?; let mut found=plan_matches(&layout.windows[index..],&current,&used)[0];
         if found.is_none(){
-            // Chrome cannot reconstruct a specific window's tabs from its title.
-            // Never launch another instance when other Chrome windows are present.
-            if is_chrome(&s.exe) && (current.iter().any(|w|equivalent(&s.exe,&w.exe)) || !chrome_launches.insert(s.exe.to_lowercase())) {
-                failed.push(format!("{} (finestra Chrome non identificabile con certezza)",s.title));continue;
+            // A generic executable cannot identify which document or window to
+            // reopen. Explorer folders are an explicit exception: they have a
+            // saved path and can be opened independently.
+            if s.folder.is_none() && (current.iter().any(|w|equivalent(&s.exe,&w.exe)) || !launched_exes.insert(s.exe.to_lowercase())) {
+                failed.push(format!("{} (finestra non identificabile con certezza)",s.title));continue;
             }
             let launched=if let Some(folder)=&s.folder{crate::explorer::launch(folder).map_err(|e|e.to_string())}else{launch_application(&s.exe)};
             match launched { Ok(())=>{for _ in 0..30{thread::sleep(Duration::from_millis(300));current=windows()?;found=plan_matches(&layout.windows[index..],&current,&used)[0];if found.is_some(){break}}}, Err(error)=>{failed.push(format!("{} ({error})",s.title));continue;} }
