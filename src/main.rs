@@ -3,6 +3,8 @@
 mod core;
 mod explorer;
 mod spinner;
+mod startup;
+mod success;
 #[cfg(test)]
 mod version;
 
@@ -30,6 +32,7 @@ const NIF_ICON: u32 = 2;
 const NIF_TIP: u32 = 4;
 const MF_STRING: u32 = 0;
 const MF_SEPARATOR: u32 = 0x800;
+const MF_CHECKED: u32 = 0x8;
 const TPM_RIGHTBUTTON: u32 = 2;
 const TPM_RETURNCMD: u32 = 0x100;
 const ERROR_ALREADY_EXISTS: u32 = 183;
@@ -100,7 +103,7 @@ unsafe fn tray_data(hwnd: Handle) -> NotifyIconDataW {
 }
 fn start_job(hwnd: Handle, save: bool) {
     if BUSY.swap(true, Ordering::AcqRel) { tell("Un'operazione è già in corso. Attendi il completamento.", true); return; }
-    unsafe { spinner::start(hwnd); }
+    unsafe { success::stop(hwnd); spinner::start(hwnd); }
     let target = hwnd as usize;
     let started = std::thread::Builder::new().spawn(move || {
         let outcome = std::panic::catch_unwind(|| if save { core::save() } else { core::restore() });
@@ -124,6 +127,7 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
     if msg != 0 && msg == TASKBAR_CREATED.load(Ordering::Relaxed) {
         Shell_NotifyIconW(NIM_ADD, &mut tray_data(hwnd));
         if BUSY.load(Ordering::Acquire) { spinner::tick(hwnd); }
+        else if success::active() { success::draw(hwnd); }
         return 0;
     }
     match msg {
@@ -132,13 +136,23 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
             if !menu.is_null() {
                 AppendMenuW(menu, MF_STRING, 1, wide("Memorizza finestre").as_ptr());
                 AppendMenuW(menu, MF_STRING, 2, wide("Ripristina finestre").as_ptr());
+                let startup_status = startup::enabled();
+                AppendMenuW(menu, MF_STRING | if matches!(startup_status, Ok(true)) { MF_CHECKED } else { 0 }, 5, wide("Avvia con Windows").as_ptr());
                 AppendMenuW(menu, MF_STRING, 4, wide("Informazioni sulla versione").as_ptr());
                 AppendMenuW(menu, MF_SEPARATOR, 0, null());
                 AppendMenuW(menu, MF_STRING, 3, wide("Esci").as_ptr());
                 let mut p = Point { x: 0, y: 0 }; GetCursorPos(&mut p); SetForegroundWindow(hwnd);
                 let command = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, p.x, p.y, 0, hwnd, null());
                 DestroyMenu(menu); PostMessageW(hwnd, 0, 0, 0);
-                match command { 1 => start_job(hwnd, true), 2 => start_job(hwnd, false), 4 => tell(concat!("myDesktop ", env!("MYDESKTOP_VERSION")), false), 3 if !BUSY.load(Ordering::Acquire) => { DestroyWindow(hwnd); }, 3 => tell("Attendi il completamento dell'operazione prima di uscire.", true), _ => () }
+                match command {
+                    1 => start_job(hwnd, true),
+                    2 => start_job(hwnd, false),
+                    4 => tell(concat!("myDesktop ", env!("MYDESKTOP_VERSION")), false),
+                    5 => match startup_status { Ok(enabled) => if let Err(e)=startup::set(!enabled) { tell(&e,true); }, Err(e)=>tell(&e,true) },
+                    3 if !BUSY.load(Ordering::Acquire) => { DestroyWindow(hwnd); },
+                    3 => tell("Attendi il completamento dell'operazione prima di uscire.", true),
+                    _ => ()
+                }
             }
             0
         }
@@ -147,16 +161,17 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
             if BUSY.load(Ordering::Acquire) { spinner::tick(hwnd); } else { spinner::stop(hwnd); }
             0
         }
+        WM_TIMER if w == success::TIMER_ID => { if !BUSY.load(Ordering::Acquire) && success::active() && success::expired() { success::stop(hwnd); } 0 }
         JOB_FINISHED => {
             let result = JOB_RESULT.lock().unwrap_or_else(|e| e.into_inner()).take();
             if let Some((message, error)) = result {
                 BUSY.store(false, Ordering::Release);
                 spinner::stop(hwnd);
-                tell(&message, error);
+                if error { tell(&message, true); } else { success::start(hwnd); }
             }
             0
         }
-        WM_DESTROY => { spinner::stop(hwnd); Shell_NotifyIconW(NIM_DELETE, &mut tray_data(hwnd)); PostQuitMessage(0); 0 }
+        WM_DESTROY => { success::stop(hwnd); spinner::stop(hwnd); Shell_NotifyIconW(NIM_DELETE, &mut tray_data(hwnd)); PostQuitMessage(0); 0 }
         _ => DefWindowProcW(hwnd, msg, w, l),
     }
 }

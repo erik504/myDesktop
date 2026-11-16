@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, fs, mem::{size_of, zeroed}, os::windows::ffi::OsStrExt, path::PathBuf, process::Command, thread, time::Duration};
+use std::{collections::HashSet, fs, mem::{size_of, zeroed}, os::windows::ffi::OsStrExt, path::{Path, PathBuf}, process::Command, thread, time::Duration};
 
 type Hwnd = isize;
 #[repr(C)] #[derive(Clone, Copy, Default, Serialize, Deserialize)]
@@ -34,6 +34,7 @@ struct Rect { left: i32, top: i32, right: i32, bottom: i32 }
     fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
 }
 #[link(name="dwmapi")] unsafe extern "system" { fn DwmGetWindowAttribute(hwnd: Hwnd, attr: u32, value: *mut u32, size: u32) -> i32; }
+#[link(name="shell32")] unsafe extern "system" { fn ShellExecuteW(hwnd: Hwnd, operation: *const u16, file: *const u16, parameters: *const u16, directory: *const u16, show: i32) -> isize; }
 
 fn text(buf: &[u16]) -> String { String::from_utf16_lossy(&buf[..buf.iter().position(|&c| c == 0).unwrap_or(buf.len())]) }
 fn db_path() -> Result<PathBuf,String> { let p=std::env::var_os("APPDATA").ok_or("Cartella APPDATA non disponibile")?; Ok(PathBuf::from(p).join("myDesktop").join("layout.json")) }
@@ -89,10 +90,29 @@ pub fn save()->Result<String,String>{
     #[test] fn selects_saved_physical_monitor_and_falls_back_to_primary(){let ms=vec![monitor("physical-B","display1",true),monitor("physical-A","display2",false)];let mut s=saved();assert_eq!(target(&s,&ms).unwrap().device,"display2");s.monitor_id="missing".into();assert_eq!(target(&s,&ms).unwrap().device,"display1");}
     #[test] fn matches_title_and_never_reuses_window(){let s=saved();let a=vec![live(1,"other",None),live(2,"first",None)];let mut used=HashSet::new();assert_eq!(best(&s,&a,&used),Some(2));used.insert(2);assert_eq!(best(&s,&a,&used),Some(1));}
     #[test] fn matches_explorer_folder(){let mut s=saved();s.folder=Some("C:\\folder".into());let a=vec![live(1,"first",Some("C:\\other")),live(2,"other",Some("c:\\FOLDER"))];assert_eq!(best(&s,&a,&HashSet::new()),Some(2));}
+    #[test] fn matches_mfc_changed_handles_only_for_same_style_and_title(){let mut s=saved();s.class="Afx:00400000:28:00010007:00000000:00000000".into();let mut w=live(1,"first",None);w.class="Afx:00700000:28:00020007:00000000:00000000".into();assert!(matches(&s,&w));w.title="another".into();assert!(!matches(&s,&w));w.title="first".into();w.class="Afx:00700000:29:00020007:00000000:00000000".into();assert!(!matches(&s,&w));}
+    #[test] fn exact_class_match_outranks_mfc_fallback(){let mut s=saved();s.class="Afx:00400000:28:00010007:00000000:00000000".into();let mut a=live(1,"first",None);a.class="Afx:00700000:28:00020007:00000000:00000000".into();let mut b=live(2,"first",None);b.class=s.class.clone();assert_eq!(best(&s,&[a,b],&HashSet::new()),Some(2));}
+    #[test] fn mfc_fallback_requires_same_executable_and_valid_class(){let mut s=saved();s.class="Afx:00400000:28:00010007:00000000:00000000".into();let mut w=live(1,"first",None);w.class="Afx:00700000:28:00020007:00000000:00000000".into();w.exe="C:\\Another.exe".into();assert!(!matches(&s,&w));w.exe=s.exe.clone();w.class="Afx:00700000:28:broken".into();assert!(!matches(&s,&w));}
 }
 fn equivalent(a:&str,b:&str)->bool{a.eq_ignore_ascii_case(b)}
-fn matches(saved:&Window,live:&Live)->bool { equivalent(&saved.exe,&live.exe) && saved.class==live.class && match &saved.folder {Some(folder)=>live.folder.as_ref().is_some_and(|f|equivalent(folder,f)),None=>true} }
-fn best(saved:&Window, live:&[Live],used:&HashSet<Hwnd>)->Option<Hwnd>{ live.iter().filter(|w|!used.contains(&w.hwnd)&&matches(saved,w)).max_by_key(|w|if w.title==saved.title{1}else{0}).map(|w|w.hwnd) }
+fn mfc_style(class:&str)->Option<&str>{ let mut fields=class.split(':'); if fields.next()? != "Afx" {return None} let instance=fields.next()?; let style=fields.next()?; let cursor=fields.next()?; let background=fields.next()?; let icon=fields.next()?; if fields.next().is_some() || [instance,style,cursor,background,icon].iter().any(|s|s.is_empty() || !s.bytes().all(|c|c.is_ascii_hexdigit())) {return None} Some(style) }
+fn matches(saved:&Window,live:&Live)->bool { equivalent(&saved.exe,&live.exe) && (saved.class==live.class || (saved.title==live.title && mfc_style(&saved.class).is_some_and(|s|mfc_style(&live.class).is_some_and(|v|s.eq_ignore_ascii_case(v))))) && match &saved.folder {Some(folder)=>live.folder.as_ref().is_some_and(|f|equivalent(folder,f)),None=>true} }
+fn best(saved:&Window, live:&[Live],used:&HashSet<Hwnd>)->Option<Hwnd>{ live.iter().filter(|w|!used.contains(&w.hwnd)&&matches(saved,w)).max_by_key(|w|(w.title==saved.title,w.class==saved.class)).map(|w|w.hwnd) }
+fn launch_application(exe:&str)->Result<(),String>{
+    let mut command=Command::new(exe);
+    if let Some(parent)=Path::new(exe).parent(){command.current_dir(parent);}
+    match command.spawn(){
+        Ok(_)=>Ok(()),
+        Err(e) if e.raw_os_error()==Some(740)=>{
+            // The Windows shell performs the normal UAC consent flow when needed.
+            let file:Vec<u16>=std::ffi::OsStr::new(exe).encode_wide().chain(Some(0)).collect();
+            let directory:Option<Vec<u16>>=Path::new(exe).parent().map(|p|p.as_os_str().encode_wide().chain(Some(0)).collect());
+            let result=unsafe{ShellExecuteW(0,std::ptr::null(),file.as_ptr(),std::ptr::null(),directory.as_ref().map_or(std::ptr::null(),|p|p.as_ptr()),1)};
+            if result>32 {Ok(())} else {Err(format!("Avvio con richiesta di autorizzazione non riuscito (codice {result}): {exe}"))}
+        },
+        Err(e)=>Err(format!("Impossibile avviare {exe}: {e}")),
+    }
+}
 fn target<'a>(w:&Window,monitors:&'a [Monitor])->Option<&'a Monitor>{
     // Device registry key identifies a physical display across changes to its position.
     let by_id=if w.monitor_id.is_empty(){None}else{monitors.iter().find(|m|m.id.eq_ignore_ascii_case(&w.monitor_id))};
@@ -105,10 +125,10 @@ pub fn restore()->Result<String,String>{
     for s in &layout.windows {
         let mut current=windows()?; let mut found=best(s,&current,&used);
         if found.is_none(){
-            let launched=if let Some(folder)=&s.folder{crate::explorer::launch(folder)}else{Command::new(&s.exe).spawn().map(|_|())};
-            if launched.is_ok(){for _ in 0..30{thread::sleep(Duration::from_millis(300));current=windows()?;found=best(s,&current,&used);if found.is_some(){break}}}
+            let launched=if let Some(folder)=&s.folder{crate::explorer::launch(folder).map_err(|e|e.to_string())}else{launch_application(&s.exe)};
+            match launched { Ok(())=>{for _ in 0..30{thread::sleep(Duration::from_millis(300));current=windows()?;found=best(s,&current,&used);if found.is_some(){break}}}, Err(error)=>{failed.push(format!("{} ({error})",s.title));continue;} }
         }
-        if let Some(h)=found { used.insert(h); let m=target(s,&monitors).unwrap(); let r=s.rect; let mut x=m.rect.left+r.left; let mut y=m.rect.top+r.top; let mut width=(r.right-r.left).max(1); let mut height=(r.bottom-r.top).max(1); let same=if s.monitor_id.is_empty(){m.device.eq_ignore_ascii_case(&s.monitor_device)}else{m.id.eq_ignore_ascii_case(&s.monitor_id)}; if !same {width=width.min(m.work.right-m.work.left);height=height.min(m.work.bottom-m.work.top);x=x.clamp(m.work.left,m.work.right-width);y=y.clamp(m.work.top,m.work.bottom-height);} let ok=unsafe {ShowWindow(h,9); let ok=SetWindowPos(h,0,x,y,width,height,0x14); if s.show==3{ShowWindow(h,3);}else if [2,6,7,11].contains(&s.show){ShowWindow(h,6);} ok}; if ok!=0{succeeded+=1}else{failed.push(s.title.clone())} } else {failed.push(s.title.clone())}
+        if let Some(h)=found { used.insert(h); let m=target(s,&monitors).unwrap(); let r=s.rect; let mut x=m.rect.left+r.left; let mut y=m.rect.top+r.top; let mut width=(r.right-r.left).max(1); let mut height=(r.bottom-r.top).max(1); let same=if s.monitor_id.is_empty(){m.device.eq_ignore_ascii_case(&s.monitor_device)}else{m.id.eq_ignore_ascii_case(&s.monitor_id)}; if !same {width=width.min(m.work.right-m.work.left);height=height.min(m.work.bottom-m.work.top);x=x.clamp(m.work.left,m.work.right-width);y=y.clamp(m.work.top,m.work.bottom-height);} let result=unsafe {ShowWindow(h,9); let ok=SetWindowPos(h,0,x,y,width,height,0x14); let error=if ok==0{Some(std::io::Error::last_os_error())}else{None}; if s.show==3{ShowWindow(h,3);}else if [2,6,7,11].contains(&s.show){ShowWindow(h,6);} error}; if let Some(error)=result {if error.raw_os_error()==Some(5){failed.push(format!("{} (accesso negato: prova ad avviare myDesktop come amministratore)",s.title))}else{failed.push(format!("{} ({error})",s.title))}} else {succeeded+=1} } else {failed.push(s.title.clone())}
     }
-    if failed.is_empty(){Ok(format!("Ripristinate {succeeded} finestre."))} else {Ok(format!("Ripristinate {succeeded} finestre; {} non ripristinate: {}",failed.len(),failed.join(", ")))}
+    if failed.is_empty(){Ok(format!("Ripristinate {succeeded} finestre."))} else {Err(format!("Ripristinate {succeeded} finestre; {} non ripristinate: {}",failed.len(),failed.join(", ")))}
 }
