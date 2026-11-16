@@ -48,11 +48,11 @@ pub unsafe fn draw(hwnd: Handle) {
     let mut mask=[0xffu8; N*4];
     let Some(mut pixels)=original_pixels() else {return};
     for y in 0..N { for x in 0..N {
-        let dx=x as i32-20; let dy=y as i32-20;
+        let dx=x as i32-16; let dy=y as i32-16;
         let at=(y*N+x)*4;
         if dx*dx+dy*dy<=11*11 {
-            let white=(x>=12 && x<=19 && (y as i32-(x as i32+4)).abs()<=2)
-                || (x>=18 && x<=28 && (y as i32-(42-x as i32)).abs()<=2);
+            let white=(x>=8 && x<=15 && (y as i32-(x as i32+4)).abs()<=2)
+                || (x>=14 && x<=24 && (y as i32-(34-x as i32)).abs()<=2);
             pixels[at..at+4].copy_from_slice(if white {&[255,255,255,255]} else {&[35,135,25,255]});
         }
         if pixels[at+3]!=0 {mask[y*4+x/8]&=!(0x80>>(x%8));}
