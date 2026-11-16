@@ -87,7 +87,7 @@ unsafe fn tray_data(hwnd: Handle) -> NotifyIconDataW {
     let mut data: NotifyIconDataW = std::mem::zeroed();
     data.size = std::mem::size_of::<NotifyIconDataW>() as u32;
     data.hwnd = hwnd; data.id = 1; data.flags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-    data.callback = TRAY_CALLBACK; data.icon = LoadIconW(null_mut(), 32512usize as *const u16);
+    data.callback = TRAY_CALLBACK; data.icon = LoadIconW(GetModuleHandleW(null()), 1usize as *const u16);
     for (out, ch) in data.tip.iter_mut().zip(wide("myDesktop - configurazione finestre")) { *out = ch; }
     data
 }

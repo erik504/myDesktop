@@ -6,7 +6,7 @@ La memorizzazione sostituisce la disposizione salvata in precedenza nel file `%A
 
 ## Compilazione
 
-Installare la toolchain Rust per Windows, quindi eseguire:
+Installare la toolchain Rust per Windows e il Windows SDK (incluso `rc.exe`), quindi eseguire:
 
 ```powershell
 cargo build --release
