@@ -6,6 +6,27 @@ mod version;
 // The next commit after this one is the first versioned commit (0.0.1).
 const BASE: &str = "1670e5586f72abfb8284777332b0fb7b9644e09e";
 
+#[cfg(windows)]
+fn build_date() -> String {
+    #[repr(C)]
+    struct SystemTime { year:u16, month:u16, day_of_week:u16, day:u16, hour:u16, minute:u16, second:u16, milliseconds:u16 }
+    #[link(name="kernel32")]
+    extern "system" { fn GetLocalTime(time:*mut SystemTime); }
+    let mut time=SystemTime{year:0,month:0,day_of_week:0,day:0,hour:0,minute:0,second:0,milliseconds:0};
+    unsafe { GetLocalTime(&mut time) };
+    format!("{:04}-{:02}-{:02}",time.year,time.month,time.day)
+}
+#[cfg(not(windows))]
+fn build_date() -> String {
+    // Gregorian UTC fallback for cross-build hosts without Win32 GetLocalTime.
+    let days=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("Invalid build clock").as_secs()/86400;
+    let z=days as i64+719468; let era=z/146097; let doe=z-era*146097;
+    let yoe=(doe-doe/1460+doe/36524-doe/146096)/365; let y=yoe+era*400;
+    let doy=doe-(365*yoe+yoe/4-yoe/100); let mp=(5*doy+2)/153;
+    let day=doy-(153*mp+2)/5+1; let month=mp+if mp<10 {3} else {-9};
+    format!("{:04}-{:02}-{:02}",y+if month<=2 {1} else {0},month,day)
+}
+
 fn git(args: &[&str]) -> Option<String> {
     let output = Command::new("git").args(args).output().ok()?;
     if !output.status.success() { return None; }
@@ -38,8 +59,10 @@ fn app_version() -> String {
 
 fn main() {
     println!("cargo:rerun-if-changed=icon.ico");
+    println!("cargo:rerun-if-changed=src");
     let value = app_version();
     println!("cargo:rustc-env=MYDESKTOP_VERSION={value}");
+    println!("cargo:rustc-env=MYDESKTOP_BUILD_DATE={}",build_date());
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") { return; }
     let parts: Vec<u32> = value.split('.').map(|v| v.parse().unwrap()).collect();
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());

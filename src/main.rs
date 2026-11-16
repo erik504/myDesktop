@@ -1,10 +1,14 @@
 #![windows_subsystem = "windows"]
 
 mod core;
+mod dialogs;
 mod explorer;
+mod ipc;
+mod protected;
 mod spinner;
 mod startup;
 mod success;
+mod service;
 #[cfg(test)]
 mod version;
 
@@ -38,7 +42,8 @@ const TPM_RETURNCMD: u32 = 0x100;
 const ERROR_ALREADY_EXISTS: u32 = 183;
 static BUSY: AtomicBool = AtomicBool::new(false);
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
-static JOB_RESULT: Mutex<Option<(String, bool)>> = Mutex::new(None);
+enum JobCompletion { Standard(Result<String, String>), Service { install: bool, result: Result<(), String> } }
+static JOB_RESULT: Mutex<Option<JobCompletion>> = Mutex::new(None);
 
 #[repr(C)]
 struct WndClassW {
@@ -83,14 +88,25 @@ extern "system" {
     fn SetProcessDPIAware() -> i32;
 }
 #[link(name = "shell32")]
-extern "system" { fn Shell_NotifyIconW(message: u32, data: *mut NotifyIconDataW) -> i32; }
+extern "system" { fn Shell_NotifyIconW(message: u32, data: *mut NotifyIconDataW) -> i32; fn ShellExecuteExW(info: *mut ShellExecuteInfo) -> i32; }
+#[repr(C)]
+struct ShellExecuteInfo {
+    size: u32, mask: u32, owner: Handle, verb: *const u16, file: *const u16,
+    parameters: *const u16, directory: *const u16, show: i32, instance: Handle,
+    id_list: *mut c_void, class: *const u16, class_key: Handle, hot_key: u32,
+    icon_or_monitor: Handle, process: Handle,
+}
 #[link(name = "kernel32")]
 extern "system" {
     fn GetModuleHandleW(name: *const u16) -> Handle;
     fn CreateMutexW(attrs: *mut c_void, owner: i32, name: *const u16) -> Handle;
     fn GetLastError() -> u32;
     fn CloseHandle(handle: Handle) -> i32;
+    fn WaitForSingleObject(handle: Handle, timeout: u32) -> u32;
+    fn GetExitCodeProcess(handle: Handle, exit: *mut u32) -> i32;
 }
+#[link(name = "ole32")]
+extern "system" { fn CoInitializeEx(reserved: *mut c_void, flags: u32) -> i32; fn CoUninitialize(); }
 fn wide(s: &str) -> Vec<u16> { s.encode_utf16().chain(Some(0)).collect() }
 fn tell(s: &str, error: bool) { unsafe { MessageBoxW(null_mut(), wide(s).as_ptr(), wide("myDesktop").as_ptr(), if error { 0x10 } else { 0x40 }); } }
 unsafe fn tray_data(hwnd: Handle) -> NotifyIconDataW {
@@ -101,17 +117,13 @@ unsafe fn tray_data(hwnd: Handle) -> NotifyIconDataW {
     for (out, ch) in data.tip.iter_mut().zip(wide("myDesktop - configurazione finestre")) { *out = ch; }
     data
 }
-fn start_job(hwnd: Handle, save: bool) {
+fn start_job(hwnd: Handle, save: bool, path: Option<std::path::PathBuf>) {
     if BUSY.swap(true, Ordering::AcqRel) { tell("Un'operazione è già in corso. Attendi il completamento.", true); return; }
     unsafe { success::stop(hwnd); spinner::start(hwnd); }
     let target = hwnd as usize;
     let started = std::thread::Builder::new().spawn(move || {
-        let outcome = std::panic::catch_unwind(|| if save { core::save() } else { core::restore() });
-        let result = match outcome {
-            Ok(Ok(message)) => (message, false),
-            Ok(Err(message)) => (message, true),
-            Err(_) => ("Errore inatteso durante l'operazione.".into(), true),
-        };
+        let outcome = std::panic::catch_unwind(|| match (save, path.as_deref()) { (true, Some(path)) => core::save_to(path), (false, Some(path)) => core::restore_from(path), (true, None) => core::save(), (false, None) => core::restore() });
+        let result = JobCompletion::Standard(match outcome { Ok(result) => result, Err(_) => Err("Errore inatteso durante l'operazione.".into()) });
         *JOB_RESULT.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
         if unsafe { PostMessageW(target as Handle, JOB_FINISHED, 0, 0) } == 0 {
             BUSY.store(false, Ordering::Release);
@@ -122,6 +134,37 @@ fn start_job(hwnd: Handle, save: bool) {
         unsafe { spinner::stop(hwnd); }
         tell(&format!("Impossibile avviare l'operazione: {e}"), true);
     }
+}
+fn start_service_change(hwnd: Handle, install: bool) {
+    if BUSY.swap(true, Ordering::AcqRel) { tell("Un'operazione è già in corso. Attendi il completamento.", true); return; }
+    unsafe { success::stop(hwnd); spinner::start(hwnd); }
+    let target = hwnd as usize;
+    let started = std::thread::Builder::new().spawn(move || {
+        let operation = std::panic::catch_unwind(|| -> Result<(),String> { unsafe {
+            let exe = std::env::current_exe().map_err(|e|format!("Impossibile trovare l'eseguibile: {e}"))?;
+            use std::os::windows::ffi::OsStrExt;
+            let file: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
+            let verb=wide("runas");
+            let argument=if install { format!("--install-service {}", service::current_user_sid()?) } else { "--uninstall-service".into() };
+            let parameters=wide(&argument);
+            let mut info: ShellExecuteInfo = std::mem::zeroed();
+            info.size=std::mem::size_of::<ShellExecuteInfo>() as u32; info.mask=0x40 | 0x100;
+            info.owner=target as Handle; info.verb=verb.as_ptr(); info.file=file.as_ptr(); info.parameters=parameters.as_ptr(); info.show=1;
+            let initialized=CoInitializeEx(null_mut(),2)>=0;
+            let ok=ShellExecuteExW(&mut info);
+            if ok==0 { let e=std::io::Error::last_os_error(); if initialized {CoUninitialize();} return Err(if e.raw_os_error()==Some(1223) { "Operazione annullata: autorizzazione amministrativa non concessa.".into() } else { format!("Impossibile avviare l'operazione amministrativa: {e}") }); }
+            if info.process.is_null() { if initialized {CoUninitialize();} return Err("Impossibile attendere l'operazione amministrativa.".into()); }
+            let waited=WaitForSingleObject(info.process, 0xffff_ffff); let mut exit=1u32;
+            let read=GetExitCodeProcess(info.process, &mut exit); CloseHandle(info.process); if initialized {CoUninitialize();}
+            if waited!=0 || read==0 { return Err("Impossibile verificare l'esito dell'operazione amministrativa.".into()); }
+            if exit!=0 { return Err("L'operazione sul servizio non è riuscita. Controlla il messaggio di errore mostrato da Windows.".into()); }
+            Ok(())
+        }});
+        let result=operation.unwrap_or_else(|_|Err("Errore inatteso durante la gestione del servizio.".into()));
+        *JOB_RESULT.lock().unwrap_or_else(|e|e.into_inner())=Some(JobCompletion::Service {install, result});
+        if unsafe { PostMessageW(target as Handle, JOB_FINISHED, 0, 0) } == 0 { BUSY.store(false, Ordering::Release); }
+    });
+    if let Err(e)=started { BUSY.store(false, Ordering::Release); unsafe { spinner::stop(hwnd); } tell(&format!("Impossibile avviare l'operazione: {e}"), true); }
 }
 unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam) -> Lresult {
     if msg != 0 && msg == TASKBAR_CREATED.load(Ordering::Relaxed) {
@@ -136,8 +179,13 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
             if !menu.is_null() {
                 AppendMenuW(menu, MF_STRING, 1, wide("Memorizza finestre").as_ptr());
                 AppendMenuW(menu, MF_STRING, 2, wide("Ripristina finestre").as_ptr());
+                AppendMenuW(menu, MF_STRING, 6, wide("Memorizza finestre come...").as_ptr());
+                AppendMenuW(menu, MF_STRING, 7, wide("Ripristina finestre da...").as_ptr());
+                let service_status=service::is_installed();
                 let startup_status = startup::enabled();
-                AppendMenuW(menu, MF_STRING | if matches!(startup_status, Ok(true)) { MF_CHECKED } else { 0 }, 5, wide("Avvia con Windows").as_ptr());
+                let incomplete=matches!((&startup_status,&service_status),(Ok(a),Ok(b)) if a!=b);
+                let startup_label=if incomplete {"Avvia con Windows (configurazione incompleta)"} else {"Avvia con Windows"};
+                AppendMenuW(menu, MF_STRING | if matches!(startup_status, Ok(true)) || matches!(service_status, Ok(true)) { MF_CHECKED } else { 0 }, 5, wide(startup_label).as_ptr());
                 AppendMenuW(menu, MF_STRING, 4, wide("Informazioni sulla versione").as_ptr());
                 AppendMenuW(menu, MF_SEPARATOR, 0, null());
                 AppendMenuW(menu, MF_STRING, 3, wide("Esci").as_ptr());
@@ -145,10 +193,21 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
                 let command = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, p.x, p.y, 0, hwnd, null());
                 DestroyMenu(menu); PostMessageW(hwnd, 0, 0, 0);
                 match command {
-                    1 => start_job(hwnd, true),
-                    2 => start_job(hwnd, false),
-                    4 => tell(concat!("myDesktop ", env!("MYDESKTOP_VERSION")), false),
-                    5 => match startup_status { Ok(enabled) => if let Err(e)=startup::set(!enabled) { tell(&e,true); }, Err(e)=>tell(&e,true) },
+                    1 => start_job(hwnd, true, None),
+                    2 => start_job(hwnd, false, None),
+                    6 | 7 => {
+                        if BUSY.load(Ordering::Acquire) { tell("Un'operazione è già in corso. Attendi il completamento.", true); }
+                        else { match dialogs::choose(hwnd, command==6) { Ok(Some(path)) => start_job(hwnd, command==6, Some(path)), Ok(None) => (), Err(e) => tell(&e,true) } }
+                    },
+                    4 => tell(concat!("myDesktop ", env!("MYDESKTOP_VERSION"), "\nData di compilazione: ", env!("MYDESKTOP_BUILD_DATE")), false),
+                    5 => match (startup_status,service_status) {
+                        (Err(e),_) | (_,Err(e)) => tell(&e,true),
+                        (Ok(startup),Ok(installed)) => {
+                            if BUSY.load(Ordering::Acquire) {tell("Un'operazione è già in corso. Attendi il completamento.",true);}
+                            else if !installed && startup { match startup::set(false) {Ok(())=>{DestroyWindow(hwnd);},Err(e)=>tell(&e,true)} }
+                            else { start_service_change(hwnd, !installed); }
+                        }
+                    },
                     3 if !BUSY.load(Ordering::Acquire) => { DestroyWindow(hwnd); },
                     3 => tell("Attendi il completamento dell'operazione prima di uscire.", true),
                     _ => ()
@@ -164,10 +223,19 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
         WM_TIMER if w == success::TIMER_ID => { if !BUSY.load(Ordering::Acquire) && success::active() && success::expired() { success::stop(hwnd); } 0 }
         JOB_FINISHED => {
             let result = JOB_RESULT.lock().unwrap_or_else(|e| e.into_inner()).take();
-            if let Some((message, error)) = result {
+            if let Some(result) = result {
                 BUSY.store(false, Ordering::Release);
                 spinner::stop(hwnd);
-                if error { tell(&message, true); } else { success::start(hwnd); }
+                match result {
+                    JobCompletion::Standard(Ok(_)) => success::start(hwnd),
+                    JobCompletion::Standard(Err(message)) => tell(&message, true),
+                    JobCompletion::Service { install, result: Err(message) } => { let _=install; tell(&message, true); },
+                    JobCompletion::Service { install, result: Ok(()) } => {
+                        if let Err(e)=startup::set(install) { tell(&e,true); }
+                        else if install { success::start(hwnd); }
+                        else { DestroyWindow(hwnd); }
+                    }
+                }
             }
             0
         }
@@ -175,7 +243,19 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
         _ => DefWindowProcW(hwnd, msg, w, l),
     }
 }
-fn main() { unsafe {
+fn main() { 
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        Some("--install-service") | Some("--uninstall-service") => {
+            let result=if args[1]=="--install-service" { if args.len()!=3 {Err("Identità dell'utente non specificata.".into())} else {service::install_for(&args[2])} } else if args.len()!=2 {Err("Argomenti non validi.".into())} else {service::uninstall()};
+            if let Err(error)=result {tell(&error,true);std::process::exit(1);} return;
+        },
+        Some("--service") => {if args.len()!=3 || service::run(&args[2]).is_err(){std::process::exit(1)} return;},
+        Some("--elevated-helper") => {unsafe { if SetProcessDpiAwarenessContext(-4)==0 {SetProcessDPIAware();} } if args.len()!=2 || ipc::serve().is_err(){std::process::exit(1)} return;},
+        Some(_) => {tell("Argomento non riconosciuto.", true); std::process::exit(1);},
+        None => ()
+    }
+    unsafe {
     if SetProcessDpiAwarenessContext(-4) == 0 { SetProcessDPIAware(); }
     let mutex = CreateMutexW(null_mut(), 0, wide("Local\\myDesktop.Singleton").as_ptr());
     if mutex.is_null() { tell("Impossibile inizializzare myDesktop.", true); return; }

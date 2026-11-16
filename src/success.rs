@@ -34,7 +34,9 @@ pub unsafe fn draw(hwnd: Handle) {
         let white=(x>=7 && x<=14 && (y as i32-(x as i32+7)).abs()<=2)
             || (x>=12 && x<=25 && (y as i32-(33-x as i32)).abs()<=2);
         let color=if white {[255,255,255,255]} else {[35,135,25,255]};
-        let row=N-1-y; let at=(row*N+x)*4;
+        // CreateIcon consumes these device-dependent bitmap bits in top-down
+        // scanline order; reversing rows flips the check mark upside down.
+        let row=y; let at=(row*N+x)*4;
         pixels[at..at+4].copy_from_slice(&color); mask[row*4+x/8]&=!(0x80>>(x%8));
     }}
     unsafe {

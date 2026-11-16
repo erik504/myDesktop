@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, fs, mem::{size_of, zeroed}, os::windows::ffi::OsStrExt, path::{Path, PathBuf}, process::Command, thread, time::Duration};
+use std::{collections::HashSet, fs, io::Write, mem::{size_of, zeroed}, os::windows::ffi::OsStrExt, path::{Path, PathBuf}, process::Command, sync::atomic::{AtomicU64, Ordering}, thread, time::Duration};
 
 type Hwnd = isize;
 #[repr(C)] #[derive(Clone, Copy, Default, Serialize, Deserialize)]
@@ -18,8 +18,8 @@ struct Rect { left: i32, top: i32, right: i32, bottom: i32 }
     fn GetWindowTextW(hwnd: Hwnd, text: *mut u16, max: i32) -> i32;
     fn GetClassNameW(hwnd: Hwnd, name: *mut u16, max: i32) -> i32;
     fn GetWindowThreadProcessId(hwnd: Hwnd, pid: *mut u32) -> u32;
-    fn GetWindowPlacement(hwnd: Hwnd, p: *mut Placement) -> i32;
-    fn GetWindowRect(hwnd: Hwnd, r: *mut Rect) -> i32;
+    fn GetWindowPlacement(hwnd: Hwnd, p: *mut std::ffi::c_void) -> i32;
+    fn GetWindowRect(hwnd: Hwnd, r: *mut std::ffi::c_void) -> i32;
     fn MonitorFromWindow(hwnd: Hwnd, flags: u32) -> isize;
     fn EnumDisplayMonitors(dc: isize, clip: *const Rect, cb: Option<unsafe extern "system" fn(isize,isize,*mut Rect,isize)->i32>, arg: isize) -> i32;
     fn GetMonitorInfoW(m: isize, info: *mut MonitorInfo) -> i32;
@@ -28,8 +28,8 @@ struct Rect { left: i32, top: i32, right: i32, bottom: i32 }
     fn ShowWindow(hwnd: Hwnd, cmd: i32) -> i32;
 }
 #[link(name="kernel32")] unsafe extern "system" {
-    fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
-    fn QueryFullProcessImageNameW(process: isize, flags: u32, path: *mut u16, size: *mut u32) -> i32;
+    fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
+    fn QueryFullProcessImageNameW(process: *mut std::ffi::c_void, flags: u32, path: *mut u16, size: *mut u32) -> i32;
     fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
     fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
 }
@@ -54,7 +54,7 @@ unsafe fn monitor_data(h: isize) -> Option<Monitor> { unsafe {
 } }
 unsafe extern "system" fn monitor_cb(h:isize,_:isize,_:*mut Rect,arg:isize)->i32 { unsafe { if let Some(m)=monitor_data(h) { (*(arg as *mut Vec<Monitor>)).push(m); } } 1 }
 fn monitors()->Vec<Monitor>{ let mut m=Vec::new(); unsafe { EnumDisplayMonitors(0,std::ptr::null(),Some(monitor_cb),&mut m as *mut _ as isize); } m }
-unsafe fn process_path(pid:u32)->Option<String>{ unsafe { let p=OpenProcess(0x1000,0,pid); if p==0{return None} let mut b=vec![0u16;32768]; let mut n=b.len() as u32; let ok=QueryFullProcessImageNameW(p,0,b.as_mut_ptr(),&mut n); CloseHandle(p as *mut std::ffi::c_void); if ok==0 {None} else {Some(String::from_utf16_lossy(&b[..n as usize]))} } }
+unsafe fn process_path(pid:u32)->Option<String>{ unsafe { let p=OpenProcess(0x1000,0,pid); if p.is_null(){return None} let mut b=vec![0u16;32768]; let mut n=b.len() as u32; let ok=QueryFullProcessImageNameW(p,0,b.as_mut_ptr(),&mut n); CloseHandle(p); if ok==0 {None} else {Some(String::from_utf16_lossy(&b[..n as usize]))} } }
 unsafe extern "system" fn window_cb(h:Hwnd,arg:isize)->i32 { unsafe {
     if IsWindowVisible(h)==0 || GetWindow(h,4)!=0 || GetWindowLongW(h,-20)&0x80!=0 { return 1; }
     let mut cloaked=0u32; if DwmGetWindowAttribute(h,14,&mut cloaked,4)==0 && cloaked!=0 {return 1}
@@ -64,22 +64,33 @@ unsafe extern "system" fn window_cb(h:Hwnd,arg:isize)->i32 { unsafe {
     if ["Progman","WorkerW","Shell_TrayWnd","Windows.UI.Core.CoreWindow"].contains(&class.as_str()) {return 1}
     let len=GetWindowTextLengthW(h).clamp(0,32767); let mut tb=vec![0u16;len as usize+1]; GetWindowTextW(h,tb.as_mut_ptr(),tb.len() as i32); let title=text(&tb);
     if title.is_empty() {return 1}
-    let mut wp:Placement=zeroed(); wp.length=size_of::<Placement>() as u32; if GetWindowPlacement(h,&mut wp)==0{return 1}
+    let mut wp:Placement=zeroed(); wp.length=size_of::<Placement>() as u32; if GetWindowPlacement(h,(&mut wp as *mut Placement).cast())==0{return 1}
     let monitor=MonitorFromWindow(h,2); let Some(mi)=monitor_data(monitor) else{return 1};
-    let mut r=Rect::default(); if wp.show==1 { GetWindowRect(h,&mut r); } else { r=wp.normal; let dx=mi.work.left-mi.rect.left; let dy=mi.work.top-mi.rect.top; r.left+=dx;r.right+=dx;r.top+=dy;r.bottom+=dy; }
+    let mut r=Rect::default(); if wp.show==1 { GetWindowRect(h,(&mut r as *mut Rect).cast()); } else { r=wp.normal; let dx=mi.work.left-mi.rect.left; let dy=mi.work.top-mi.rect.top; r.left+=dx;r.right+=dx;r.top+=dy;r.bottom+=dy; }
     (*(arg as *mut Vec<Live>)).push(Live{ hwnd:h,exe,class,title,folder:None,monitor,rect:r,show:wp.show }); 1
 } }
 fn windows()->Result<Vec<Live>,String>{ let mut v:Vec<Live>=Vec::new(); unsafe{EnumWindows(Some(window_cb),&mut v as *mut _ as isize);} let folders=crate::explorer::capture()?; for w in &mut v { w.folder=folders.get(&w.hwnd).cloned(); if w.class=="CabinetWClass" && w.folder.is_none(){return Err(format!("Impossibile leggere la cartella di Esplora file: {}",w.title));} } Ok(v) }
 
 pub fn save()->Result<String,String>{
+    save_to(&db_path()?)
+}
+pub fn save_to(path: &Path)->Result<String,String>{
     let mut out=Vec::new(); for w in windows()?{ if let Some(m)=unsafe{monitor_data(w.monitor)} {out.push(Window{exe:w.exe,class:w.class,title:w.title,folder:w.folder,monitor_id:m.id,monitor_device:m.device,rect:Rect{left:w.rect.left-m.rect.left,top:w.rect.top-m.rect.top,right:w.rect.right-m.rect.left,bottom:w.rect.bottom-m.rect.top},show:w.show});} }
     if out.is_empty(){return Err("Nessuna finestra gestibile trovata: configurazione precedente conservata.".into())}
-    let path=db_path()?; fs::create_dir_all(path.parent().unwrap()).map_err(|e|e.to_string())?;
+    fs::create_dir_all(path.parent().ok_or("Cartella del file non valida")?).map_err(|e|e.to_string())?;
     let data=serde_json::to_vec_pretty(&Layout{version:1,windows:out}).map_err(|e|e.to_string())?;
-    let tmp=path.with_extension("json.tmp"); fs::write(&tmp,data).map_err(|e|e.to_string())?;
-    let from:Vec<u16>=tmp.as_os_str().encode_wide().chain(Some(0)).collect(); let to:Vec<u16>=path.as_os_str().encode_wide().chain(Some(0)).collect();
-    if unsafe{MoveFileExW(from.as_ptr(),to.as_ptr(),0x9)}==0{return Err(format!("Impossibile sostituire il salvataggio: {}",std::io::Error::last_os_error()))}
+    write_layout(path, &data)?;
     Ok(format!("Configurazione salvata in {}",path.display()))
+}
+fn write_layout(path: &Path, data: &[u8]) -> Result<(), String> {
+    static NEXT: AtomicU64=AtomicU64::new(0);
+    let mut name=path.as_os_str().to_os_string(); name.push(format!(".{}.{}.tmp",std::process::id(),NEXT.fetch_add(1,Ordering::Relaxed)));
+    let tmp=PathBuf::from(name);
+    let mut file=fs::OpenOptions::new().write(true).create_new(true).open(&tmp).map_err(|e|format!("Impossibile creare il file temporaneo: {e}"))?;
+    if let Err(e)=file.write_all(&data){drop(file);let _=fs::remove_file(&tmp);return Err(format!("Impossibile scrivere il file temporaneo: {e}"));} drop(file);
+    let from:Vec<u16>=tmp.as_os_str().encode_wide().chain(Some(0)).collect(); let to:Vec<u16>=path.as_os_str().encode_wide().chain(Some(0)).collect();
+    if unsafe{MoveFileExW(from.as_ptr(),to.as_ptr(),0x9)}==0{let e=std::io::Error::last_os_error();let _=fs::remove_file(&tmp);return Err(format!("Impossibile sostituire il salvataggio: {e}"))}
+    Ok(())
 }
 
 #[cfg(test)] mod tests {
@@ -93,6 +104,7 @@ pub fn save()->Result<String,String>{
     #[test] fn matches_mfc_changed_handles_only_for_same_style_and_title(){let mut s=saved();s.class="Afx:00400000:28:00010007:00000000:00000000".into();let mut w=live(1,"first",None);w.class="Afx:00700000:28:00020007:00000000:00000000".into();assert!(matches(&s,&w));w.title="another".into();assert!(!matches(&s,&w));w.title="first".into();w.class="Afx:00700000:29:00020007:00000000:00000000".into();assert!(!matches(&s,&w));}
     #[test] fn exact_class_match_outranks_mfc_fallback(){let mut s=saved();s.class="Afx:00400000:28:00010007:00000000:00000000".into();let mut a=live(1,"first",None);a.class="Afx:00700000:28:00020007:00000000:00000000".into();let mut b=live(2,"first",None);b.class=s.class.clone();assert_eq!(best(&s,&[a,b],&HashSet::new()),Some(2));}
     #[test] fn mfc_fallback_requires_same_executable_and_valid_class(){let mut s=saved();s.class="Afx:00400000:28:00010007:00000000:00000000".into();let mut w=live(1,"first",None);w.class="Afx:00700000:28:00020007:00000000:00000000".into();w.exe="C:\\Another.exe".into();assert!(!matches(&s,&w));w.exe=s.exe.clone();w.class="Afx:00700000:28:broken".into();assert!(!matches(&s,&w));}
+    #[test] fn named_layout_writes_selected_file_and_preserves_other_file(){let dir=std::env::temp_dir().join(format!("mydesktop-layout-test-{}-{:?}",std::process::id(),std::thread::current().id()));fs::create_dir(&dir).unwrap();let a=dir.join("first.json");let b=dir.join("second.json");write_layout(&a,b"first").unwrap();write_layout(&b,b"second").unwrap();write_layout(&a,b"updated").unwrap();assert_eq!(fs::read(&a).unwrap(),b"updated");assert_eq!(fs::read(&b).unwrap(),b"second");fs::remove_file(a).unwrap();fs::remove_file(b).unwrap();fs::remove_dir(dir).unwrap();}
 }
 fn equivalent(a:&str,b:&str)->bool{a.eq_ignore_ascii_case(b)}
 fn mfc_style(class:&str)->Option<&str>{ let mut fields=class.split(':'); if fields.next()? != "Afx" {return None} let instance=fields.next()?; let style=fields.next()?; let cursor=fields.next()?; let background=fields.next()?; let icon=fields.next()?; if fields.next().is_some() || [instance,style,cursor,background,icon].iter().any(|s|s.is_empty() || !s.bytes().all(|c|c.is_ascii_hexdigit())) {return None} Some(style) }
@@ -119,7 +131,10 @@ fn target<'a>(w:&Window,monitors:&'a [Monitor])->Option<&'a Monitor>{
     by_id.or_else(||if w.monitor_id.is_empty(){monitors.iter().find(|m|m.device.eq_ignore_ascii_case(&w.monitor_device))}else{None}).or_else(||monitors.iter().find(|m|m.primary)).or_else(||monitors.first())
 }
 pub fn restore()->Result<String,String>{
-    let data=fs::read(db_path()?).map_err(|e|format!("Impossibile leggere la configurazione salvata: {e}"))?; let layout:Layout=serde_json::from_slice(&data).map_err(|e|format!("Configurazione non valida: {e}"))?; if layout.version!=1{return Err("Versione della configurazione non supportata.".into())}
+    restore_from(&db_path()?)
+}
+pub fn restore_from(path: &Path)->Result<String,String>{
+    let data=fs::read(path).map_err(|e|format!("Impossibile leggere la configurazione salvata: {e}"))?; let layout:Layout=serde_json::from_slice(&data).map_err(|e|format!("Configurazione non valida: {e}"))?; if layout.version!=1{return Err("Versione della configurazione non supportata.".into())}
     let monitors=monitors(); if monitors.is_empty(){return Err("Nessun monitor disponibile.".into())}
     let mut used=HashSet::new(); let mut succeeded=0; let mut failed=Vec::new();
     for s in &layout.windows {
@@ -128,7 +143,7 @@ pub fn restore()->Result<String,String>{
             let launched=if let Some(folder)=&s.folder{crate::explorer::launch(folder).map_err(|e|e.to_string())}else{launch_application(&s.exe)};
             match launched { Ok(())=>{for _ in 0..30{thread::sleep(Duration::from_millis(300));current=windows()?;found=best(s,&current,&used);if found.is_some(){break}}}, Err(error)=>{failed.push(format!("{} ({error})",s.title));continue;} }
         }
-        if let Some(h)=found { used.insert(h); let m=target(s,&monitors).unwrap(); let r=s.rect; let mut x=m.rect.left+r.left; let mut y=m.rect.top+r.top; let mut width=(r.right-r.left).max(1); let mut height=(r.bottom-r.top).max(1); let same=if s.monitor_id.is_empty(){m.device.eq_ignore_ascii_case(&s.monitor_device)}else{m.id.eq_ignore_ascii_case(&s.monitor_id)}; if !same {width=width.min(m.work.right-m.work.left);height=height.min(m.work.bottom-m.work.top);x=x.clamp(m.work.left,m.work.right-width);y=y.clamp(m.work.top,m.work.bottom-height);} let result=unsafe {ShowWindow(h,9); let ok=SetWindowPos(h,0,x,y,width,height,0x14); let error=if ok==0{Some(std::io::Error::last_os_error())}else{None}; if s.show==3{ShowWindow(h,3);}else if [2,6,7,11].contains(&s.show){ShowWindow(h,6);} error}; if let Some(error)=result {if error.raw_os_error()==Some(5){failed.push(format!("{} (accesso negato: prova ad avviare myDesktop come amministratore)",s.title))}else{failed.push(format!("{} ({error})",s.title))}} else {succeeded+=1} } else {failed.push(s.title.clone())}
+        if let Some(h)=found { used.insert(h); let m=target(s,&monitors).unwrap(); let r=s.rect; let mut x=m.rect.left+r.left; let mut y=m.rect.top+r.top; let mut width=(r.right-r.left).max(1); let mut height=(r.bottom-r.top).max(1); let same=if s.monitor_id.is_empty(){m.device.eq_ignore_ascii_case(&s.monitor_device)}else{m.id.eq_ignore_ascii_case(&s.monitor_id)}; if !same {width=width.min(m.work.right-m.work.left);height=height.min(m.work.bottom-m.work.top);x=x.clamp(m.work.left,m.work.right-width);y=y.clamp(m.work.top,m.work.bottom-height);} let result=unsafe {ShowWindow(h,9); let ok=SetWindowPos(h,0,x,y,width,height,0x14); let error=if ok==0{Some(std::io::Error::last_os_error())}else{None}; if error.is_none(){if s.show==3{ShowWindow(h,3);}else if [2,6,7,11].contains(&s.show){ShowWindow(h,6);}} error}; if let Some(error)=result {if error.raw_os_error()==Some(5){match crate::ipc::move_window(h,x,y,width,height,s.show){Ok(())=>succeeded+=1,Err(e)=>failed.push(format!("{} (accesso negato; {e})",s.title))}}else{failed.push(format!("{} ({error})",s.title))}} else {succeeded+=1} } else {failed.push(s.title.clone())}
     }
     if failed.is_empty(){Ok(format!("Ripristinate {succeeded} finestre."))} else {Err(format!("Ripristinate {succeeded} finestre; {} non ripristinate: {}",failed.len(),failed.join(", ")))}
 }
