@@ -2,7 +2,7 @@
 
 Utility per Windows 10 e 11 che memorizza e ripristina la disposizione delle finestre sui monitor. Avviare `mydesktop.exe`: l'icona appare nell'area di notifica, eventualmente nel menu delle icone nascoste. Fare clic destro sull'icona e scegliere **Memorizza finestre**, **Ripristina finestre** oppure **Esci**.
 
-La voce **Avvia con Windows** installa il servizio e abilita l'avvio del tray al login dell'utente corrente. È richiesta la conferma amministrativa UAC dello stesso utente. Disattivandola, il servizio viene disinstallato, l'avvio automatico disabilitato e il tray chiuso. Il singolo eseguibile rimane copiato in `%ProgramFiles%\myDesktop` in una cartella protetta per consentire una successiva riattivazione. Durante le operazioni il tray mostra uno spinner; una spunta verde indica il successo. Gli errori vengono mostrati in una finestra di dialogo.
+La voce **Avvia con Windows** installa il servizio e abilita l'avvio del tray al login dell'utente corrente. È richiesta la conferma amministrativa UAC dello stesso utente. Disattivandola, il servizio viene fermato e disinstallato e l'avvio automatico disabilitato; il tray rimane aperto fino a quando si sceglie **Esci**. Il singolo eseguibile rimane copiato in `%ProgramFiles%\myDesktop` in una cartella protetta per consentire una successiva riattivazione. Durante le operazioni il tray mostra uno spinner; una spunta verde indica il successo. Gli errori vengono mostrati in una finestra di dialogo.
 
 I comandi **Memorizza finestre come...** e **Ripristina finestre da...** permettono di scegliere file di configurazione con nome. I comandi senza il suffisso usano sempre il file predefinito descritto sotto.
 

@@ -204,7 +204,7 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
                         (Err(e),_) | (_,Err(e)) => tell(&e,true),
                         (Ok(startup),Ok(installed)) => {
                             if BUSY.load(Ordering::Acquire) {tell("Un'operazione è già in corso. Attendi il completamento.",true);}
-                            else if !installed && startup { match startup::set(false) {Ok(())=>{DestroyWindow(hwnd);},Err(e)=>tell(&e,true)} }
+                            else if !installed && startup { match startup::set(false) {Ok(())=>success::start(hwnd),Err(e)=>tell(&e,true)} }
                             else { start_service_change(hwnd, !installed); }
                         }
                     },
@@ -232,8 +232,7 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
                     JobCompletion::Service { install, result: Err(message) } => { let _=install; tell(&message, true); },
                     JobCompletion::Service { install, result: Ok(()) } => {
                         if let Err(e)=startup::set(install) { tell(&e,true); }
-                        else if install { success::start(hwnd); }
-                        else { DestroyWindow(hwnd); }
+                        else { success::start(hwnd); }
                     }
                 }
             }
