@@ -2,6 +2,7 @@
 
 mod core;
 mod dialogs;
+mod error_indicator;
 mod explorer;
 mod ipc;
 mod protected;
@@ -14,7 +15,7 @@ mod version;
 
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::Mutex;
 
 type Handle = *mut c_void;
@@ -42,6 +43,7 @@ const TPM_RETURNCMD: u32 = 0x100;
 const ERROR_ALREADY_EXISTS: u32 = 183;
 static BUSY: AtomicBool = AtomicBool::new(false);
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+static TRAY_WINDOW: AtomicIsize = AtomicIsize::new(0);
 enum JobCompletion { Standard(Result<String, String>), Service { install: bool, result: Result<(), String> } }
 static JOB_RESULT: Mutex<Option<JobCompletion>> = Mutex::new(None);
 
@@ -108,7 +110,7 @@ extern "system" {
 #[link(name = "ole32")]
 extern "system" { fn CoInitializeEx(reserved: *mut c_void, flags: u32) -> i32; fn CoUninitialize(); }
 fn wide(s: &str) -> Vec<u16> { s.encode_utf16().chain(Some(0)).collect() }
-fn tell(s: &str, error: bool) { unsafe { MessageBoxW(null_mut(), wide(s).as_ptr(), wide("myDesktop").as_ptr(), if error { 0x10 } else { 0x40 }); } }
+fn tell(s: &str, error: bool) { unsafe { if error { let hwnd=TRAY_WINDOW.load(Ordering::Acquire) as Handle; if !hwnd.is_null(){error_indicator::report(hwnd,s);} } else { MessageBoxW(null_mut(), wide(s).as_ptr(), wide("myDesktop").as_ptr(), 0x40); } } }
 unsafe fn tray_data(hwnd: Handle) -> NotifyIconDataW {
     let mut data: NotifyIconDataW = std::mem::zeroed();
     data.size = std::mem::size_of::<NotifyIconDataW>() as u32;
@@ -157,7 +159,7 @@ fn start_service_change(hwnd: Handle, install: bool) {
             let waited=WaitForSingleObject(info.process, 0xffff_ffff); let mut exit=1u32;
             let read=GetExitCodeProcess(info.process, &mut exit); CloseHandle(info.process); if initialized {CoUninitialize();}
             if waited!=0 || read==0 { return Err("Impossibile verificare l'esito dell'operazione amministrativa.".into()); }
-            if exit!=0 { return Err("L'operazione sul servizio non è riuscita. Controlla il messaggio di errore mostrato da Windows.".into()); }
+            if exit!=0 { return Err("L'operazione sul servizio non è riuscita.".into()); }
             Ok(())
         }});
         let result=operation.unwrap_or_else(|_|Err("Errore inatteso durante la gestione del servizio.".into()));
@@ -170,6 +172,7 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
     if msg != 0 && msg == TASKBAR_CREATED.load(Ordering::Relaxed) {
         Shell_NotifyIconW(NIM_ADD, &mut tray_data(hwnd));
         if BUSY.load(Ordering::Acquire) { spinner::tick(hwnd); }
+        else if error_indicator::active() { error_indicator::draw(hwnd); }
         else if success::active() { success::draw(hwnd); }
         return 0;
     }
@@ -217,9 +220,10 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
         }
         WM_COMMAND => 0,
         WM_TIMER if w == spinner::TIMER_ID => {
-            if BUSY.load(Ordering::Acquire) { spinner::tick(hwnd); } else { spinner::stop(hwnd); }
+            if BUSY.load(Ordering::Acquire) { spinner::tick(hwnd); } else { spinner::stop(hwnd); if error_indicator::active(){error_indicator::draw(hwnd);} }
             0
         }
+        WM_TIMER if w == error_indicator::TIMER => { if !BUSY.load(Ordering::Acquire) { error_indicator::tick(hwnd); } 0 }
         WM_TIMER if w == success::TIMER_ID => { if !BUSY.load(Ordering::Acquire) && success::active() && success::expired() { success::stop(hwnd); } 0 }
         JOB_FINISHED => {
             let result = JOB_RESULT.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -227,12 +231,12 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
                 BUSY.store(false, Ordering::Release);
                 spinner::stop(hwnd);
                 match result {
-                    JobCompletion::Standard(Ok(_)) => success::start(hwnd),
+                    JobCompletion::Standard(Ok(_)) => if error_indicator::active(){error_indicator::draw(hwnd)}else{success::start(hwnd)},
                     JobCompletion::Standard(Err(message)) => tell(&message, true),
                     JobCompletion::Service { install, result: Err(message) } => { let _=install; tell(&message, true); },
                     JobCompletion::Service { install, result: Ok(()) } => {
                         if let Err(e)=startup::set(install) { tell(&e,true); }
-                        else { success::start(hwnd); }
+                        else if error_indicator::active(){error_indicator::draw(hwnd)}else{success::start(hwnd)}
                     }
                 }
             }
@@ -266,6 +270,7 @@ fn main() {
     if RegisterClassW(&class) == 0 { tell("Impossibile inizializzare la finestra di myDesktop.", true); CloseHandle(mutex); return; }
     let hwnd = CreateWindowExW(0, class_name.as_ptr(), wide("myDesktop").as_ptr(), 0, 0, 0, 0, 0, null_mut(), null_mut(), instance, null_mut());
     if hwnd.is_null() { tell("Impossibile avviare myDesktop.", true); CloseHandle(mutex); return; }
+    TRAY_WINDOW.store(hwnd as isize,Ordering::Release);
     if Shell_NotifyIconW(NIM_ADD, &mut tray_data(hwnd)) == 0 { tell("Impossibile mostrare l'icona nell'area di notifica.", true); DestroyWindow(hwnd); CloseHandle(mutex); return; }
     let mut msg: Msg = std::mem::zeroed();
     while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 { TranslateMessage(&msg); DispatchMessageW(&msg); }

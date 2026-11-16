@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, fs, io::Write, mem::{size_of, zeroed}, os::windows::ffi::OsStrExt, path::{Path, PathBuf}, process::Command, sync::atomic::{AtomicU64, Ordering}, thread, time::Duration};
 
 type Hwnd = isize;
-#[repr(C)] #[derive(Clone, Copy, Default, Serialize, Deserialize)]
+#[repr(C)] #[derive(Clone, Copy, Default, PartialEq, Eq, Debug, Serialize, Deserialize)]
 struct Rect { left: i32, top: i32, right: i32, bottom: i32 }
 #[repr(C)] #[derive(Clone, Copy, Default)] struct Point { x: i32, y: i32 }
 #[repr(C)] #[derive(Clone, Copy)] struct Placement { length: u32, flags: u32, show: u32, min: Point, max: Point, normal: Rect }
@@ -130,6 +130,76 @@ fn target<'a>(w:&Window,monitors:&'a [Monitor])->Option<&'a Monitor>{
     let by_id=if w.monitor_id.is_empty(){None}else{monitors.iter().find(|m|m.id.eq_ignore_ascii_case(&w.monitor_id))};
     by_id.or_else(||if w.monitor_id.is_empty(){monitors.iter().find(|m|m.device.eq_ignore_ascii_case(&w.monitor_device))}else{None}).or_else(||monitors.iter().find(|m|m.primary)).or_else(||monitors.first())
 }
+fn state_kind(show:u32)->u8 { if show==3 {1} else if [2,6,7,11].contains(&show) {2} else {0} }
+fn interpolate(a:i32,b:i32,step:i64,total:i64)->i32 { (i64::from(a)+(i64::from(b)-i64::from(a))*step/total) as i32 }
+#[derive(Debug,PartialEq,Eq)] enum PlacementAction { None, StateOnly, Geometry }
+fn placement_action(old:Rect,old_show:u32,new:Rect,new_show:u32)->PlacementAction {
+    if old!=new {PlacementAction::Geometry} else if state_kind(old_show)!=state_kind(new_show) {PlacementAction::StateOnly} else {PlacementAction::None}
+}
+#[cfg(test)]
+#[test]
+fn skips_unchanged_window_and_distinguishes_state_and_geometry() {
+    let r=Rect{left:10,top:20,right:110,bottom:120};
+    assert_eq!(placement_action(r,1,r,1),PlacementAction::None);
+    assert_eq!(placement_action(r,3,r,3),PlacementAction::None);
+    assert_eq!(placement_action(r,1,r,3),PlacementAction::StateOnly);
+    assert_eq!(placement_action(r,1,Rect{left:11,right:111,..r},1),PlacementAction::Geometry);
+    assert_eq!(interpolate(-100,100,20,20),100);
+}
+#[cfg(test)]
+#[test]
+fn actual_window_is_untouched_then_moves_smoothly() {
+    use std::{ffi::c_void, ptr::{null,null_mut}, sync::atomic::{AtomicUsize,Ordering}};
+    static CHANGES:AtomicUsize=AtomicUsize::new(0);
+    unsafe extern "system" fn proc(h:*mut c_void,m:u32,w:usize,l:isize)->isize {
+        if m==0x46 {CHANGES.fetch_add(1,Ordering::SeqCst);} unsafe{crate::DefWindowProcW(h,m,w,l)}
+    }
+    let name:Vec<u16>="myDesktopPlacementTest".encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        let instance=crate::GetModuleHandleW(null());let class=crate::WndClassW{style:0,wnd_proc:Some(proc),cls_extra:0,wnd_extra:0,instance,icon:null_mut(),cursor:null_mut(),background:null_mut(),menu_name:null(),class_name:name.as_ptr()};
+        assert_ne!(crate::RegisterClassW(&class),0);
+        let window=crate::CreateWindowExW(0,name.as_ptr(),name.as_ptr(),0,40,40,200,100,null_mut(),null_mut(),instance,null_mut());assert!(!window.is_null());let hwnd=window as isize;
+        let mut rect=Rect::default();assert_ne!(GetWindowRect(hwnd,(&mut rect as *mut Rect).cast()),0);
+        let live=Live{hwnd,exe:String::new(),class:String::new(),title:String::new(),folder:None,monitor:0,rect,show:1};
+        CHANGES.store(0,Ordering::SeqCst);place_window(hwnd,&live,rect,1).unwrap();assert_eq!(CHANGES.load(Ordering::SeqCst),0);
+        let goal=Rect{left:rect.left+20,right:rect.right+20,..rect};let start=std::time::Instant::now();place_window(hwnd,&live,goal,1).unwrap();
+        assert!(start.elapsed()>=Duration::from_millis(450));let mut actual=Rect::default();assert_ne!(GetWindowRect(hwnd,(&mut actual as *mut Rect).cast()),0);assert_eq!(actual,goal);assert!(CHANGES.load(Ordering::SeqCst)>1);
+        crate::DestroyWindow(window);
+    }
+}
+fn place_window(h:Hwnd, live:&Live, target:Rect, show:u32)->Result<(),String> {
+    let old_state=state_kind(live.show); let new_state=state_kind(show);
+    let action=placement_action(live.rect,live.show,target,show);
+    if action==PlacementAction::None {return Ok(());}
+    let width=(target.right-target.left).max(1); let height=(target.bottom-target.top).max(1);
+    if action==PlacementAction::StateOnly {
+        unsafe {ShowWindow(h, if new_state==1 {3} else if new_state==2 {6} else {9});}
+        let mut p:Placement=unsafe{zeroed()};p.length=size_of::<Placement>() as u32;
+        if unsafe{GetWindowPlacement(h,(&mut p as *mut Placement).cast())}!=0 && state_kind(p.show)==new_state {return Ok(());}
+        return crate::ipc::move_window(h,target.left,target.top,width,height,show);
+    }
+    // Preserve normal windows' state and size whenever possible. Minimized or
+    // maximized windows must first be restored to change their normal rectangle.
+    if old_state!=0 {unsafe{ShowWindow(h,9);}}
+    let size_same=live.rect.right-live.rect.left==width && live.rect.bottom-live.rect.top==height;
+    let smooth=old_state==0 && new_state==0;
+    let steps=if smooth {20} else {1};
+    let started=std::time::Instant::now();
+    for step in 1..=steps {
+        if smooth {let due=Duration::from_millis(500*step as u64/steps as u64);if let Some(wait)=due.checked_sub(started.elapsed()){thread::sleep(wait);}}
+        let x=interpolate(live.rect.left,target.left,step,steps);
+        let y=interpolate(live.rect.top,target.top,step,steps);
+        let w=interpolate(live.rect.right-live.rect.left,width,step,steps);
+        let hgt=interpolate(live.rect.bottom-live.rect.top,height,step,steps);
+        let flags=0x14 | if size_same {1} else {0};
+        if unsafe{SetWindowPos(h,0,x,y,w,hgt,flags)}==0 {
+            let error=std::io::Error::last_os_error();
+            return if error.raw_os_error()==Some(5) {crate::ipc::move_window(h,target.left,target.top,width,height,show)} else {Err(error.to_string())};
+        }
+    }
+    if new_state!=0 {unsafe{ShowWindow(h,if new_state==1 {3}else{6});}}
+    Ok(())
+}
 pub fn restore()->Result<String,String>{
     restore_from(&db_path()?)
 }
@@ -143,7 +213,7 @@ pub fn restore_from(path: &Path)->Result<String,String>{
             let launched=if let Some(folder)=&s.folder{crate::explorer::launch(folder).map_err(|e|e.to_string())}else{launch_application(&s.exe)};
             match launched { Ok(())=>{for _ in 0..30{thread::sleep(Duration::from_millis(300));current=windows()?;found=best(s,&current,&used);if found.is_some(){break}}}, Err(error)=>{failed.push(format!("{} ({error})",s.title));continue;} }
         }
-        if let Some(h)=found { used.insert(h); let m=target(s,&monitors).unwrap(); let r=s.rect; let mut x=m.rect.left+r.left; let mut y=m.rect.top+r.top; let mut width=(r.right-r.left).max(1); let mut height=(r.bottom-r.top).max(1); let same=if s.monitor_id.is_empty(){m.device.eq_ignore_ascii_case(&s.monitor_device)}else{m.id.eq_ignore_ascii_case(&s.monitor_id)}; if !same {width=width.min(m.work.right-m.work.left);height=height.min(m.work.bottom-m.work.top);x=x.clamp(m.work.left,m.work.right-width);y=y.clamp(m.work.top,m.work.bottom-height);} let result=unsafe {ShowWindow(h,9); let ok=SetWindowPos(h,0,x,y,width,height,0x14); let error=if ok==0{Some(std::io::Error::last_os_error())}else{None}; if error.is_none(){if s.show==3{ShowWindow(h,3);}else if [2,6,7,11].contains(&s.show){ShowWindow(h,6);}} error}; if let Some(error)=result {if error.raw_os_error()==Some(5){match crate::ipc::move_window(h,x,y,width,height,s.show){Ok(())=>succeeded+=1,Err(e)=>failed.push(format!("{} (accesso negato; {e})",s.title))}}else{failed.push(format!("{} ({error})",s.title))}} else {succeeded+=1} } else {failed.push(s.title.clone())}
+        if let Some(h)=found { used.insert(h); let m=target(s,&monitors).unwrap(); let r=s.rect; let mut x=m.rect.left+r.left; let mut y=m.rect.top+r.top; let mut width=(r.right-r.left).max(1); let mut height=(r.bottom-r.top).max(1); let same=if s.monitor_id.is_empty(){m.device.eq_ignore_ascii_case(&s.monitor_device)}else{m.id.eq_ignore_ascii_case(&s.monitor_id)}; if !same {width=width.min(m.work.right-m.work.left);height=height.min(m.work.bottom-m.work.top);x=x.clamp(m.work.left,m.work.right-width);y=y.clamp(m.work.top,m.work.bottom-height);} let desired=Rect{left:x,top:y,right:x+width,bottom:y+height}; if let Some(live)=current.iter().find(|w|w.hwnd==h) {match place_window(h,live,desired,s.show){Ok(())=>succeeded+=1,Err(error)=>failed.push(format!("{} ({error})",s.title))}} else {failed.push(s.title.clone())} } else {failed.push(s.title.clone())}
     }
     if failed.is_empty(){Ok(format!("Ripristinate {succeeded} finestre."))} else {Err(format!("Ripristinate {succeeded} finestre; {} non ripristinate: {}",failed.len(),failed.join(", ")))}
 }

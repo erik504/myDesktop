@@ -10,6 +10,8 @@ Il servizio permette di riposizionare finestre elevate dello stesso utente e del
 
 La memorizzazione sostituisce la disposizione salvata in precedenza nel file `%APPDATA%\myDesktop\layout.json`, che può contenere percorsi e titoli di finestre personali. Il ripristino non chiude altre applicazioni. Le finestre vengono abbinate ai monitor salvati e, se un monitor non è disponibile, collocate sul monitor principale. Per Esplora file viene salvata la cartella della finestra; se non è leggibile, il salvataggio segnala l'errore e conserva la configurazione precedente.
 
+Gli errori sono segnalati nell'icona del tray: per leggerli, porta il mouse sull'icona. Il segnale scompare dopo la visualizzazione. Le finestre già nella posizione e nello stato salvati non vengono modificate; dove possibile, gli spostamenti normali sono animati per circa 500 ms. Le finestre che richiedono il servizio privilegiato possono spostarsi senza animazione.
+
 ## Compilazione
 
 Installare la toolchain Rust per Windows e il Windows SDK (incluso `rc.exe`), quindi eseguire:
