@@ -43,6 +43,17 @@ fn original_pixels()->Option<[u8;4096]> {
 }
 #[cfg(test)]
 #[test] fn embedded_icon_has_expected_frame() { assert!(original_pixels().is_some()); assert_eq!(DISPLAY_MS,1250); }
+// DrawIconEx uses premultiplied alpha for 32-bit icons.
+fn fade_base(pixel:&mut [u8]) {
+    let alpha=(u16::from(pixel[3])*40+50)/100;
+    for channel in &mut pixel[..3] { *channel=((u16::from(*channel)*alpha+127)/255) as u8; }
+    pixel[3]=alpha as u8;
+}
+#[cfg(test)]
+#[test] fn fades_base_to_forty_percent_with_premultiplied_color() {
+    let mut white=[255,255,255,255];fade_base(&mut white);assert_eq!(white,[102,102,102,102]);
+    let mut invisible=[50,100,200,0];fade_base(&mut invisible);assert_eq!(invisible,[0,0,0,0]);
+}
 pub unsafe fn draw(hwnd: Handle) {
     const N: usize=32;
     let mut mask=[0xffu8; N*4];
@@ -54,7 +65,7 @@ pub unsafe fn draw(hwnd: Handle) {
             let white=(x>=8 && x<=15 && (y as i32-(x as i32+4)).abs()<=2)
                 || (x>=14 && x<=24 && (y as i32-(34-x as i32)).abs()<=2);
             pixels[at..at+4].copy_from_slice(if white {&[255,255,255,255]} else {&[35,135,25,255]});
-        }
+        } else {fade_base(&mut pixels[at..at+4]);}
         if pixels[at+3]!=0 {mask[y*4+x/8]&=!(0x80>>(x%8));}
     }}
     unsafe {
