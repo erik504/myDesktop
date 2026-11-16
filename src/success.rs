@@ -68,12 +68,16 @@ fn success_pixels()->Option<[u8;4096]> {
     let Some(mut pixels)=faded_icon_pixels() else {return None};
     for y in 0..N { for x in 0..N {
         let at=(y*N+x)*4;
+        let dx=x as i32-16;let dy=y as i32-16;
+        if dx*dx+dy*dy<=11*11 {
+            pixels[at..at+4].copy_from_slice(&[0,0,0,255]);
+        }
         let left=x>=8 && x<=15; let right=x>=14 && x<=24;
         let distance1=(y as i32-(x as i32+4)).abs();
         let distance2=(y as i32-(34-x as i32)).abs();
         if (left && distance1<=3) || (right && distance2<=3) {
             let inside=(left && distance1<=2) || (right && distance2<=2);
-            // A dark border preserves contrast on the original white artwork.
+            // Keep the green check legible on the centered black circle.
             pixels[at..at+4].copy_from_slice(if inside {&[30,200,35,255]} else {&[5,60,5,255]});
         }
     }}
@@ -84,6 +88,7 @@ fn success_pixels()->Option<[u8;4096]> {
     let base=faded_icon_pixels().unwrap();let marked=success_pixels().unwrap();
     let corner=(5*32+5)*4;assert_eq!(&marked[corner..corner+4],&base[corner..corner+4]);
     assert_eq!(marked[corner+3],179);
+    let circle=(6*32+16)*4;assert_eq!(&marked[circle..circle+4],&[0,0,0,255]);
     let check=(14*32+10)*4;assert_eq!(&marked[check..check+4],&[30,200,35,255]);
 }
 #[cfg(test)]
