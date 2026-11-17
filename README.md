@@ -2,13 +2,21 @@
 
 Utility per Windows 10 e 11 che memorizza e ripristina la disposizione delle finestre sui monitor. Avviare `mydesktop.exe`: l'icona appare nell'area di notifica, eventualmente nel menu delle icone nascoste. Fare clic destro sull'icona e scegliere **Memorizza finestre**, **Ripristina finestre** oppure **Esci**.
 
+Il menu propone tre modalità per la configurazione predefinita:
+
+- **Ripristina finestre** riposiziona le finestre riconosciute e prova a riaprire quelle mancanti, lasciando intatte le app aggiuntive.
+- **Ripristina finestre (soft)** riposiziona solo le finestre già aperte e riconoscibili; non avvia app e non apre finestre.
+- **Ripristina finestre (hard)** esegue il ripristino normale e, dopo conferma, richiede la chiusura delle app visibili assenti dal salvataggio. Le finestre aggiuntive di app presenti nel salvataggio rimangono aperte. Se il ripristino non è completo, non viene chiusa alcuna app aggiuntiva.
+
+La modalità hard invia alle finestre la normale richiesta di chiusura: le app possono chiedere di salvare il lavoro. Non termina forzatamente i processi; le app con privilegi maggiori potrebbero rifiutare la richiesta e quelle senza finestre visibili non sono gestite. Vengono considerate solo le app presenti quando inizia il ripristino, evitando di chiudere app aperte successivamente.
+
 La voce **Avvia con Windows** installa il servizio e abilita l'avvio del tray al login dell'utente corrente. È richiesta la conferma amministrativa UAC dello stesso utente. Disattivandola, il servizio viene fermato e disinstallato e l'avvio automatico disabilitato; il tray rimane aperto fino a quando si sceglie **Esci**. Il singolo eseguibile rimane copiato in `%ProgramFiles%\myDesktop` in una cartella protetta per consentire una successiva riattivazione. Durante le operazioni il tray mostra uno spinner; una spunta verde indica il successo. Gli errori vengono mostrati in una finestra di dialogo.
 
 I comandi **Memorizza finestre come...** e **Ripristina finestre da...** permettono di scegliere file di configurazione con nome. I comandi senza il suffisso usano sempre il file predefinito descritto sotto.
 
 Il servizio permette di riposizionare finestre elevate dello stesso utente e della stessa sessione. L'interfaccia continua ad aprire i programmi con i normali permessi dell'utente; la riapertura di applicazioni che richiedono privilegi elevati può richiedere UAC. Il servizio non esegue i programmi specificati nelle configurazioni. I processi dello stesso utente e della stessa sessione autorizzata possono richiedere al servizio di spostare le finestre di quell'utente. L'installazione richiede che l'utente corrente sia amministratore: le credenziali di un altro account non sono supportate.
 
-La memorizzazione sostituisce la disposizione salvata in precedenza nel file `%APPDATA%\myDesktop\layout.json`, che può contenere percorsi e titoli di finestre personali. Il ripristino non chiude altre applicazioni. Le finestre vengono abbinate ai monitor salvati e, se un monitor non è disponibile, collocate sul monitor principale. Per Esplora file viene salvata la cartella della finestra; se non è leggibile, il salvataggio segnala l'errore e conserva la configurazione precedente.
+La memorizzazione sostituisce la disposizione salvata in precedenza nel file `%APPDATA%\myDesktop\layout.json`, che può contenere percorsi e titoli di finestre personali. Il ripristino normale e quello soft non chiudono altre applicazioni. Le finestre vengono abbinate ai monitor salvati e, se un monitor non è disponibile, collocate sul monitor principale. Per Esplora file viene salvata la cartella della finestra; se non è leggibile, il salvataggio segnala l'errore e conserva la configurazione precedente.
 
 Gli errori sono segnalati nell'icona del tray: per leggerli, porta il mouse sull'icona. Il segnale scompare dopo la visualizzazione. Le finestre già nella posizione e nello stato salvati non vengono modificate; dove possibile, gli spostamenti normali sono animati per circa 500 ms. Le finestre che richiedono il servizio privilegiato possono spostarsi senza animazione.
 

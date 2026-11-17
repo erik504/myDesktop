@@ -119,12 +119,12 @@ unsafe fn tray_data(hwnd: Handle) -> NotifyIconDataW {
     for (out, ch) in data.tip.iter_mut().zip(wide("myDesktop - configurazione finestre")) { *out = ch; }
     data
 }
-fn start_job(hwnd: Handle, save: bool, path: Option<std::path::PathBuf>) {
+fn start_job(hwnd: Handle, save: bool, path: Option<std::path::PathBuf>, mode:core::RestoreMode) {
     if BUSY.swap(true, Ordering::AcqRel) { tell("Un'operazione è già in corso. Attendi il completamento.", true); return; }
     unsafe { success::stop(hwnd); spinner::start(hwnd); }
     let target = hwnd as usize;
     let started = std::thread::Builder::new().spawn(move || {
-        let outcome = std::panic::catch_unwind(|| match (save, path.as_deref()) { (true, Some(path)) => core::save_to(path), (false, Some(path)) => core::restore_from(path), (true, None) => core::save(), (false, None) => core::restore() });
+        let outcome = std::panic::catch_unwind(|| match (save, path.as_deref(),mode) { (true, Some(path),_) => core::save_to(path), (true, None,_) => core::save(), (false, Some(path),core::RestoreMode::Normal) => core::restore_from(path), (false,None,core::RestoreMode::Normal)=>core::restore(), (false,Some(path),mode)=>core::restore_from_mode(path,mode), (false,None,mode)=>core::restore_mode(mode) });
         let result = JobCompletion::Standard(match outcome { Ok(result) => result, Err(_) => Err("Errore inatteso durante l'operazione.".into()) });
         *JOB_RESULT.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
         if unsafe { PostMessageW(target as Handle, JOB_FINISHED, 0, 0) } == 0 {
@@ -182,6 +182,8 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
             if !menu.is_null() {
                 AppendMenuW(menu, MF_STRING, 1, wide("Memorizza finestre").as_ptr());
                 AppendMenuW(menu, MF_STRING, 2, wide("Ripristina finestre").as_ptr());
+                AppendMenuW(menu, MF_STRING, 8, wide("Ripristina finestre (soft)").as_ptr());
+                AppendMenuW(menu, MF_STRING, 9, wide("Ripristina finestre (hard)").as_ptr());
                 AppendMenuW(menu, MF_STRING, 6, wide("Memorizza finestre come...").as_ptr());
                 AppendMenuW(menu, MF_STRING, 7, wide("Ripristina finestre da...").as_ptr());
                 let service_status=service::is_installed();
@@ -196,11 +198,16 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
                 let command = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, p.x, p.y, 0, hwnd, null());
                 DestroyMenu(menu); PostMessageW(hwnd, 0, 0, 0);
                 match command {
-                    1 => start_job(hwnd, true, None),
-                    2 => start_job(hwnd, false, None),
+                    1 => start_job(hwnd, true, None,core::RestoreMode::Normal),
+                    2 => start_job(hwnd, false, None,core::RestoreMode::Normal),
+                    8 => start_job(hwnd, false, None,core::RestoreMode::Soft),
+                    9 => {
+                        if BUSY.load(Ordering::Acquire) {tell("Un'operazione è già in corso. Attendi il completamento.",true);}
+                        else if MessageBoxW(hwnd,wide("Il ripristino hard richiederà la chiusura delle app non presenti nel salvataggio. Le app potranno chiederti di salvare le modifiche. Continuare?").as_ptr(),wide("myDesktop - ripristino hard").as_ptr(),0x134)==6 {start_job(hwnd,false,None,core::RestoreMode::Hard);}
+                    },
                     6 | 7 => {
                         if BUSY.load(Ordering::Acquire) { tell("Un'operazione è già in corso. Attendi il completamento.", true); }
-                        else { match dialogs::choose(hwnd, command==6) { Ok(Some(path)) => start_job(hwnd, command==6, Some(path)), Ok(None) => (), Err(e) => tell(&e,true) } }
+                        else { match dialogs::choose(hwnd, command==6) { Ok(Some(path)) => start_job(hwnd, command==6, Some(path),core::RestoreMode::Normal), Ok(None) => (), Err(e) => tell(&e,true) } }
                     },
                     4 => tell(concat!("myDesktop ", env!("MYDESKTOP_VERSION"), "\nData di compilazione: ", env!("MYDESKTOP_BUILD_DATE")), false),
                     5 => match (startup_status,service_status) {

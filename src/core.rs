@@ -26,6 +26,7 @@ struct Rect { left: i32, top: i32, right: i32, bottom: i32 }
     fn EnumDisplayDevicesW(device: *const u16, index: u32, display: *mut DisplayDevice, flags: u32) -> i32;
     fn SetWindowPos(hwnd: Hwnd, after: Hwnd, x: i32, y: i32, w: i32, h: i32, flags: u32) -> i32;
     fn ShowWindow(hwnd: Hwnd, cmd: i32) -> i32;
+    fn IsWindow(hwnd: Hwnd) -> i32;
 }
 #[link(name="kernel32")] unsafe extern "system" {
     fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
@@ -133,6 +134,32 @@ fn write_layout(path: &Path, data: &[u8]) -> Result<(), String> {
         let live=vec![chrome_live(10,"Diversa",Some(id(10,456)))];
         assert_eq!(plan_matches(&saved,&live,&HashSet::new()),vec![None]);
     }
+    #[test] fn another_window_in_same_running_process_is_never_mistaken_for_saved(){
+        let saved=vec![chrome_saved("Titolo",Some(id(10,123)))];
+        let current=vec![chrome_live(20,"Titolo",Some(id(20,123)))];
+        assert_eq!(plan_matches(&saved,&current,&HashSet::new()),vec![None]);
+    }
+    #[test] fn hard_closes_only_apps_absent_from_layout(){
+        let s=saved();let mut extra=live(30,"Altra app",None);extra.exe=r"C:\Other\other.exe".into();
+        let initial=vec![live(1,"first",None),live(2,"extra della stessa app",None),extra];
+        assert!(extras_to_close(RestoreMode::Normal,&[s.clone()],&initial).is_empty());
+        assert!(extras_to_close(RestoreMode::Soft,&[s.clone()],&initial).is_empty());
+        let targets=extras_to_close(RestoreMode::Hard,&[s],&initial);
+        assert_eq!(targets.len(),1);assert_eq!(targets[0].hwnd,30);
+    }
+    #[test] fn ambiguous_extra_windows_remain_protected_on_later_passes(){
+        let saved=vec![chrome_saved("Scheda",None),chrome_saved("Scheda",None)];
+        let live=vec![chrome_live(10,"Scheda",None)];
+        let protected=protect_unmatched_initial(&saved,&live);
+        assert!(protected.contains(&10));
+        assert_eq!(plan_matches(&saved[1..],&live,&protected),vec![None]);
+    }
+    #[test] fn newly_opened_and_recycled_windows_are_not_touched(){
+        let initial=vec![chrome_live(10,"Prima",Some(id(10,123)))];
+        let mut current=vec![chrome_live(10,"Riciclata",Some(id(10,456))),chrome_live(20,"Nuova",Some(id(20,123)))];
+        let mut protected=HashSet::new();guard_live_windows(&initial,&mut current,&HashSet::new(),&mut protected);
+        assert!(protected.contains(&10));assert!(protected.contains(&20));
+    }
     #[test] fn different_applications_reserve_titles_and_never_steal_windows(){
         for exe in [r"C:\Firefox\firefox.exe",r"C:\Sublime Text\sublime_text.exe",r"C:\New App\future.exe"] {
             let mut a=saved();a.exe=exe.into();a.title="Documento A".into();
@@ -166,7 +193,14 @@ fn write_layout(path: &Path, data: &[u8]) -> Result<(), String> {
 }
 fn equivalent(a:&str,b:&str)->bool{a.eq_ignore_ascii_case(b)}
 fn mfc_style(class:&str)->Option<&str>{ let mut fields=class.split(':'); if fields.next()? != "Afx" {return None} let instance=fields.next()?; let style=fields.next()?; let cursor=fields.next()?; let background=fields.next()?; let icon=fields.next()?; if fields.next().is_some() || [instance,style,cursor,background,icon].iter().any(|s|s.is_empty() || !s.bytes().all(|c|c.is_ascii_hexdigit())) {return None} Some(style) }
-fn matches(saved:&Window,live:&Live)->bool { equivalent(&saved.exe,&live.exe) && (saved.class==live.class || (saved.title==live.title && mfc_style(&saved.class).is_some_and(|s|mfc_style(&live.class).is_some_and(|v|s.eq_ignore_ascii_case(v))))) && match &saved.folder {Some(folder)=>live.folder.as_ref().is_some_and(|f|equivalent(folder,f)),None=>true} }
+fn matches(saved:&Window,live:&Live)->bool {
+    // A different window created by the same still-running process is not the
+    // saved one, even if it happens to have the same title.
+    if let (Some(a),Some(b))=(&saved.identity,&live.identity) {
+        if a.pid==b.pid && a.created==b.created && a.hwnd!=b.hwnd {return false}
+    }
+    equivalent(&saved.exe,&live.exe) && (saved.class==live.class || (saved.title==live.title && mfc_style(&saved.class).is_some_and(|s|mfc_style(&live.class).is_some_and(|v|s.eq_ignore_ascii_case(v))))) && match &saved.folder {Some(folder)=>live.folder.as_ref().is_some_and(|f|equivalent(folder,f)),None=>true}
+}
 #[cfg(test)] fn is_chrome(exe:&str)->bool { Path::new(exe).file_name().is_some_and(|name|name.to_string_lossy().eq_ignore_ascii_case("chrome.exe")) }
 /// Reserve all confident matches before allowing weaker matches to consume windows.
 fn plan_matches(saved:&[Window],live:&[Live],used:&HashSet<Hwnd>)->Vec<Option<Hwnd>> {
@@ -195,6 +229,20 @@ fn plan_matches(saved:&[Window],live:&[Live],used:&HashSet<Hwnd>)->Vec<Option<Hw
         if competing==1 {result[i]=Some(w.hwnd);reserved.insert(w.hwnd);}
     }
     result
+}
+fn protect_unmatched_initial(saved:&[Window],initial:&[Live])->HashSet<Hwnd>{
+    let matched:HashSet<Hwnd>=plan_matches(saved,initial,&HashSet::new()).into_iter().flatten().collect();
+    initial.iter().filter(|w|!matched.contains(&w.hwnd)).map(|w|w.hwnd).collect()
+}
+fn guard_live_windows(initial:&[Live],current:&mut [Live],launched:&HashSet<Hwnd>,used:&mut HashSet<Hwnd>){
+    for w in current {
+        match initial.iter().find(|original|original.hwnd==w.hwnd) {
+            Some(original) if original.identity!=w.identity => {used.insert(w.hwnd);},
+            Some(_) => {},
+            None if launched.contains(&w.hwnd) => {w.identity=None;},
+            None => {used.insert(w.hwnd);}
+        }
+    }
 }
 fn launch_application(exe:&str)->Result<(),String>{
     let mut command=Command::new(exe);
@@ -286,26 +334,98 @@ fn place_window(h:Hwnd, live:&Live, target:Rect, show:u32)->Result<(),String> {
     if new_state!=0 {unsafe{ShowWindow(h,if new_state==1 {3}else{6});}}
     Ok(())
 }
-pub fn restore()->Result<String,String>{
-    restore_from(&db_path()?)
+#[derive(Clone,Copy,Debug,PartialEq,Eq)] pub enum RestoreMode { Normal, Soft, Hard }
+fn extras_to_close<'a>(mode:RestoreMode,saved:&[Window],initial:&'a [Live])->Vec<&'a Live>{
+    if mode!=RestoreMode::Hard{return Vec::new()}
+    initial.iter().filter(|w|!saved.iter().any(|s|equivalent(&s.exe,&w.exe))).collect()
 }
+#[derive(PartialEq,Eq)] enum WindowStatus { Same, GoneOrReplaced, Unknown }
+fn window_status(w:&Live)->WindowStatus {
+    let Some(id)=w.identity.as_ref() else{return WindowStatus::Unknown};
+    let mut pid=0;unsafe{if IsWindow(w.hwnd)==0{return WindowStatus::GoneOrReplaced} if GetWindowThreadProcessId(w.hwnd,&mut pid)==0{return WindowStatus::Unknown}}
+    if pid!=id.pid{return WindowStatus::GoneOrReplaced}
+    match crate::ipc::process_created(pid) {Some(created) if created==id.created=>WindowStatus::Same,Some(_)=>WindowStatus::GoneOrReplaced,None=>WindowStatus::Unknown}
+}
+fn close_extra_apps(mode:RestoreMode,saved:&[Window],initial:&[Live])->Vec<String>{
+    let mut failed=Vec::new();let mut requested=Vec::new();
+    for w in extras_to_close(mode,saved,initial){
+        match window_status(w){WindowStatus::Unknown=>{failed.push(format!("{} (identità non verificabile)",w.title));continue},WindowStatus::GoneOrReplaced=>continue,WindowStatus::Same=>{}}
+        // WM_CLOSE allows each application to ask about unsaved work. Never kill
+        // a process or bypass a save prompt; inaccessible windows are reported.
+        if unsafe{crate::PostMessageW(w.hwnd as *mut std::ffi::c_void,0x10,0,0)}==0 {
+            failed.push(format!("{} (chiusura non consentita: {})",w.title,std::io::Error::last_os_error()));
+        } else {requested.push(w);}
+    }
+    let until=std::time::Instant::now()+Duration::from_secs(3);
+    while std::time::Instant::now()<until && requested.iter().any(|w|window_status(w)==WindowStatus::Same){thread::sleep(Duration::from_millis(100));}
+    for w in requested {match window_status(w){WindowStatus::Same=>failed.push(format!("{} (ancora aperta; verifica eventuali richieste di salvataggio)",w.title)),WindowStatus::Unknown=>failed.push(format!("{} (impossibile verificare la chiusura)",w.title)),WindowStatus::GoneOrReplaced=>{}}}
+    failed
+}
+#[cfg(test)]
+#[test]
+fn hard_close_targets_only_extra_test_window_and_keeps_saved_app_open(){
+    use std::{ffi::c_void,ptr::{null,null_mut},sync::{atomic::{AtomicUsize,Ordering},mpsc}};
+    static DESTROYED:AtomicUsize=AtomicUsize::new(0);
+    unsafe extern "system" fn proc(h:*mut c_void,msg:u32,w:usize,l:isize)->isize {
+        if msg==2 && DESTROYED.fetch_add(1,Ordering::SeqCst)+1==2 {unsafe{crate::PostQuitMessage(0)}}
+        unsafe{crate::DefWindowProcW(h,msg,w,l)}
+    }
+    let (tx,rx)=mpsc::channel();
+    let thread=std::thread::spawn(move||unsafe{
+        let name:Vec<u16>="myDesktopCloseTest".encode_utf16().chain(Some(0)).collect();let instance=crate::GetModuleHandleW(null());
+        let class=crate::WndClassW{style:0,wnd_proc:Some(proc),cls_extra:0,wnd_extra:0,instance,icon:null_mut(),cursor:null_mut(),background:null_mut(),menu_name:null(),class_name:name.as_ptr()};
+        assert_ne!(crate::RegisterClassW(&class),0);
+        let a=crate::CreateWindowExW(0,name.as_ptr(),name.as_ptr(),0,0,0,100,100,null_mut(),null_mut(),instance,null_mut());
+        let b=crate::CreateWindowExW(0,name.as_ptr(),name.as_ptr(),0,0,0,100,100,null_mut(),null_mut(),instance,null_mut());
+        assert!(!a.is_null()&&!b.is_null());tx.send((a as isize,b as isize)).unwrap();
+        let mut msg:crate::Msg=zeroed();while crate::GetMessageW(&mut msg,null_mut(),0,0)>0 {crate::TranslateMessage(&msg);crate::DispatchMessageW(&msg);}
+    });
+    let (keep,extra)=rx.recv_timeout(Duration::from_secs(5)).unwrap();let pid=std::process::id();let created=crate::ipc::process_created(pid).unwrap();
+    let make=|hwnd:Hwnd,exe:&str|Live{hwnd,exe:exe.into(),class:"Test".into(),title:"Test".into(),folder:None,monitor:0,rect:Rect::default(),show:1,identity:Some(WindowIdentity{hwnd:hwnd as u64,pid,created})};
+    let saved=Window{exe:"C:\\saved.exe".into(),class:"Test".into(),title:"Test".into(),folder:None,monitor_id:String::new(),monitor_device:String::new(),rect:Rect::default(),show:1,identity:None};
+    let initial=vec![make(keep,"C:\\saved.exe"),make(extra,"C:\\extra.exe")];
+    assert!(close_extra_apps(RestoreMode::Normal,&[saved.clone()],&initial).is_empty());
+    assert!(close_extra_apps(RestoreMode::Soft,&[saved.clone()],&initial).is_empty());
+    assert!(window_status(&initial[0])==WindowStatus::Same&&window_status(&initial[1])==WindowStatus::Same);
+    assert!(close_extra_apps(RestoreMode::Hard,&[saved],&initial).is_empty());
+    assert!(window_status(&initial[0])==WindowStatus::Same);assert!(window_status(&initial[1])==WindowStatus::GoneOrReplaced);
+    unsafe{crate::PostMessageW(keep as *mut c_void,0x10,0,0)};thread.join().unwrap();
+}
+pub fn restore()->Result<String,String>{
+    restore_mode(RestoreMode::Normal)
+}
+pub fn restore_mode(mode:RestoreMode)->Result<String,String>{restore_from_mode(&db_path()?,mode)}
 pub fn restore_from(path: &Path)->Result<String,String>{
-    let data=fs::read(path).map_err(|e|format!("Impossibile leggere la configurazione salvata: {e}"))?; let layout:Layout=serde_json::from_slice(&data).map_err(|e|format!("Configurazione non valida: {e}"))?; if layout.version!=1{return Err("Versione della configurazione non supportata.".into())}
+    restore_from_mode(path,RestoreMode::Normal)
+}
+pub fn restore_from_mode(path:&Path,mode:RestoreMode)->Result<String,String>{
+    let data=fs::read(path).map_err(|e|format!("Impossibile leggere la configurazione salvata: {e}"))?; let layout:Layout=serde_json::from_slice(&data).map_err(|e|format!("Configurazione non valida: {e}"))?; if layout.version!=1{return Err("Versione della configurazione non supportata.".into())} if layout.windows.is_empty(){return Err("La configurazione è vuota: nessuna finestra è stata modificata.".into())}
     let monitors=monitors(); if monitors.is_empty(){return Err("Nessun monitor disponibile.".into())}
-    let mut used=HashSet::new(); let mut succeeded=0; let mut failed=Vec::new();let mut launched_exes=HashSet::new();
+    let initial=windows()?;
+    let mut used=protect_unmatched_initial(&layout.windows,&initial);
+    let mut launched_windows=HashSet::new();
+    let mut succeeded=0; let mut skipped=0; let mut failed=Vec::new();let mut launched_exes=HashSet::new();
     for (index,s) in layout.windows.iter().enumerate() {
-        let mut current=windows()?; let mut found=plan_matches(&layout.windows[index..],&current,&used)[0];
+        let mut current=windows()?;
+        guard_live_windows(&initial,&mut current,&launched_windows,&mut used);
+        let mut found=plan_matches(&layout.windows[index..],&current,&used)[0];
         if found.is_none(){
+            if mode==RestoreMode::Soft {skipped+=1;continue}
             // A generic executable cannot identify which document or window to
             // reopen. Explorer folders are an explicit exception: they have a
             // saved path and can be opened independently.
             if s.folder.is_none() && (current.iter().any(|w|equivalent(&s.exe,&w.exe)) || !launched_exes.insert(s.exe.to_lowercase())) {
                 failed.push(format!("{} (finestra non identificabile con certezza)",s.title));continue;
             }
+            let before:HashSet<Hwnd>=current.iter().map(|w|w.hwnd).collect();
             let launched=if let Some(folder)=&s.folder{crate::explorer::launch(folder).map_err(|e|e.to_string())}else{launch_application(&s.exe)};
-            match launched { Ok(())=>{for _ in 0..30{thread::sleep(Duration::from_millis(300));current=windows()?;found=plan_matches(&layout.windows[index..],&current,&used)[0];if found.is_some(){break}}}, Err(error)=>{failed.push(format!("{} ({error})",s.title));continue;} }
+            match launched { Ok(())=>{for _ in 0..30{thread::sleep(Duration::from_millis(300));current=windows()?;for w in &current {if !before.contains(&w.hwnd)&&equivalent(&s.exe,&w.exe){launched_windows.insert(w.hwnd);}}guard_live_windows(&initial,&mut current,&launched_windows,&mut used);found=plan_matches(&layout.windows[index..],&current,&used)[0];if found.is_some(){break}}}, Err(error)=>{failed.push(format!("{} ({error})",s.title));continue;} }
         }
         if let Some(h)=found { used.insert(h); let m=target(s,&monitors).unwrap(); let r=s.rect; let mut x=m.rect.left+r.left; let mut y=m.rect.top+r.top; let mut width=(r.right-r.left).max(1); let mut height=(r.bottom-r.top).max(1); let same=if s.monitor_id.is_empty(){m.device.eq_ignore_ascii_case(&s.monitor_device)}else{m.id.eq_ignore_ascii_case(&s.monitor_id)}; if !same {width=width.min(m.work.right-m.work.left);height=height.min(m.work.bottom-m.work.top);x=x.clamp(m.work.left,m.work.right-width);y=y.clamp(m.work.top,m.work.bottom-height);} let desired=Rect{left:x,top:y,right:x+width,bottom:y+height}; if let Some(live)=current.iter().find(|w|w.hwnd==h) {match place_window(h,live,desired,s.show){Ok(())=>succeeded+=1,Err(error)=>failed.push(format!("{} ({error})",s.title))}} else {failed.push(s.title.clone())} } else {failed.push(s.title.clone())}
     }
-    if failed.is_empty(){Ok(format!("Ripristinate {succeeded} finestre."))} else {Err(format!("Ripristinate {succeeded} finestre; {} non ripristinate: {}",failed.len(),failed.join(", ")))}
+    if mode==RestoreMode::Hard {
+        if failed.is_empty() {failed.extend(close_extra_apps(mode,&layout.windows,&initial));}
+        else {failed.push("Nessuna app aggiuntiva è stata chiusa perché il ripristino è incompleto".into());}
+    }
+    if failed.is_empty(){Ok(format!("Ripristinate {succeeded} finestre; {skipped} non aperte o non identificabili."))} else {Err(format!("Ripristinate {succeeded} finestre; {} problemi: {}",failed.len(),failed.join(", ")))}
 }
