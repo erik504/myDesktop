@@ -5,6 +5,7 @@ mod dialogs;
 mod error_indicator;
 mod explorer;
 mod ipc;
+mod menu_help;
 mod protected;
 mod spinner;
 mod startup;
@@ -27,6 +28,8 @@ const WM_COMMAND: u32 = 0x111;
 const WM_CONTEXTMENU: u32 = 0x7b;
 const WM_RBUTTONUP: u32 = 0x205;
 const WM_TIMER: u32 = 0x113;
+const WM_MENUSELECT: u32 = 0x11f;
+const WM_EXITMENULOOP: u32 = 0x212;
 const WM_APP: u32 = 0x8000;
 const TRAY_CALLBACK: u32 = WM_APP + 1;
 const JOB_FINISHED: u32 = WM_APP + 2;
@@ -195,9 +198,10 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
                 AppendMenuW(menu, MF_STRING, 4, wide("Informazioni sulla versione").as_ptr());
                 AppendMenuW(menu, MF_SEPARATOR, 0, null());
                 AppendMenuW(menu, MF_STRING, 3, wide("Esci").as_ptr());
+                menu_help::prepare(hwnd);
                 let mut p = Point { x: 0, y: 0 }; GetCursorPos(&mut p); SetForegroundWindow(hwnd);
                 let command = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, p.x, p.y, 0, hwnd, null());
-                DestroyMenu(menu); PostMessageW(hwnd, 0, 0, 0);
+                menu_help::hide(hwnd); DestroyMenu(menu); PostMessageW(hwnd, 0, 0, 0);
                 match command {
                     1 => start_job(hwnd, true, None,core::RestoreMode::Normal),
                     2 => start_job(hwnd, false, None,core::RestoreMode::Normal),
@@ -228,6 +232,14 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
             0
         }
         WM_COMMAND => 0,
+        WM_MENUSELECT => {
+            let flags=((w>>16)&0xffff) as u32;
+            if l==0 || flags==0xffff || flags&0x810!=0 {menu_help::hide(hwnd)}
+            else {menu_help::select(hwnd,l as Handle,(w&0xffff) as u32)}
+            0
+        }
+        WM_EXITMENULOOP => {menu_help::hide(hwnd);0}
+        WM_TIMER if w == menu_help::TIMER => {menu_help::show(hwnd);0}
         WM_TIMER if w == spinner::TIMER_ID => {
             if BUSY.load(Ordering::Acquire) { spinner::tick(hwnd); } else { spinner::stop(hwnd); if error_indicator::active(){error_indicator::draw(hwnd);} }
             0
@@ -251,7 +263,7 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
             }
             0
         }
-        WM_DESTROY => { success::stop(hwnd); spinner::stop(hwnd); Shell_NotifyIconW(NIM_DELETE, &mut tray_data(hwnd)); PostQuitMessage(0); 0 }
+        WM_DESTROY => { menu_help::destroy(hwnd); success::stop(hwnd); spinner::stop(hwnd); Shell_NotifyIconW(NIM_DELETE, &mut tray_data(hwnd)); PostQuitMessage(0); 0 }
         _ => DefWindowProcW(hwnd, msg, w, l),
     }
 }
