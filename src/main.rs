@@ -194,7 +194,6 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
                 let incomplete=matches!((&startup_status,&service_status),(Ok(a),Ok(b)) if a!=b);
                 let startup_label=if incomplete {"Avvia con Windows (configurazione incompleta)"} else {"Avvia con Windows"};
                 AppendMenuW(menu, MF_STRING | if matches!(startup_status, Ok(true)) || matches!(service_status, Ok(true)) { MF_CHECKED } else { 0 }, 5, wide(startup_label).as_ptr());
-                AppendMenuW(menu, MF_STRING, 10, wide("Guida ai comandi").as_ptr());
                 AppendMenuW(menu, MF_STRING, 4, wide("Informazioni sulla versione").as_ptr());
                 AppendMenuW(menu, MF_SEPARATOR, 0, null());
                 AppendMenuW(menu, MF_STRING, 3, wide("Esci").as_ptr());
@@ -215,7 +214,6 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
                         else { match dialogs::choose(hwnd, command==6) { Ok(Some(path)) => start_job(hwnd, command==6, Some(path),core::RestoreMode::Normal), Ok(None) => (), Err(e) => tell(&e,true) } }
                     },
                     4 => tell(concat!("myDesktop ", env!("MYDESKTOP_VERSION"), "\nData di compilazione: ", env!("MYDESKTOP_BUILD_DATE")), false),
-                    10 => tell("Memorizza finestre: salva la configurazione predefinita.\n\nRipristina finestre: ripristina la configurazione e riapre le finestre mancanti quando possibile.\n\nSolo presenti: ripristina solo le finestre già aperte.\n\nChiudi estranee: ripristina e chiede di chiudere le app assenti dal salvataggio.\n\nMemorizza come / Ripristina da: salva o apre una configurazione scelta.\n\nAvvia con Windows: gestisce l'avvio al login e il servizio.\n\nEsci: chiude myDesktop lasciando attivo il servizio installato.",false),
                     5 => match (startup_status,service_status) {
                         (Err(e),_) | (_,Err(e)) => tell(&e,true),
                         (Ok(startup),Ok(installed)) => {
