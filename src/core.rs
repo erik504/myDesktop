@@ -74,6 +74,79 @@ unsafe extern "system" fn window_cb(h:Hwnd,arg:isize)->i32 { unsafe {
 } }
 fn windows()->Result<Vec<Live>,String>{ let mut v:Vec<Live>=Vec::new(); unsafe{EnumWindows(Some(window_cb),&mut v as *mut _ as isize);} let folders=crate::explorer::capture()?; for w in &mut v { w.folder=folders.get(&w.hwnd).cloned(); if w.class=="CabinetWClass" && w.folder.is_none(){return Err(format!("Impossibile leggere la cartella di Esplora file: {}",w.title));} } Ok(v) }
 
+/// The picker uses the same eligibility rules as the normal save operation.
+pub fn selectable(hwnd:isize)->bool {
+    let mut found:Vec<Live>=Vec::new();
+    unsafe {window_cb(hwnd,&mut found as *mut _ as isize);}
+    !found.is_empty()
+}
+
+fn saved_window(w:&Live)->Result<Window,String>{
+    let m=unsafe{monitor_data(w.monitor)}.ok_or("Impossibile identificare il monitor della finestra selezionata")?;
+    Ok(Window{exe:w.exe.clone(),class:w.class.clone(),title:w.title.clone(),folder:w.folder.clone(),monitor_id:m.id,monitor_device:m.device,rect:Rect{left:w.rect.left-m.rect.left,top:w.rect.top-m.rect.top,right:w.rect.right-m.rect.left,bottom:w.rect.bottom-m.rect.top},show:w.show,identity:w.identity.clone()})
+}
+
+fn update_one(layout:&mut Layout,open:&[Live],selected:&Live,saved:Window)->Result<(),String>{
+    // A navigated Explorer window retains its identity even when its folder changes.
+    let exact:Vec<_>=layout.windows.iter().enumerate().filter(|(_,old)|
+        selected.identity.is_some() && old.identity==selected.identity && equivalent(&old.exe,&selected.exe) && old.class==selected.class
+    ).map(|(i,_)|i).collect();
+    if exact.len()>1{return Err("La finestra compare più volte nel salvataggio: impossibile aggiornarla con certezza.".into())}
+    if let Some(&i)=exact.first(){layout.windows[i]=saved;return Ok(())}
+    let plan=plan_matches(&layout.windows,open,&HashSet::new());
+    if let Some(i)=plan.iter().position(|h|*h==Some(selected.hwnd)){layout.windows[i]=saved;return Ok(())}
+    // Do not append a duplicate or overwrite another window if existing
+    // entries cannot be assigned uniquely to the current set of windows.
+    if layout.windows.iter().enumerate().any(|(i,old)|plan[i].is_none() && potentially_same_window(old,selected)) {
+        return Err("Impossibile distinguere con certezza questa finestra da altre nel salvataggio; configurazione conservata.".into());
+    }
+    layout.windows.push(saved);Ok(())
+}
+fn potentially_same_window(old:&Window,current:&Live)->bool {
+    if !equivalent(&old.exe,&current.exe){return false}
+    if old.class!=current.class && !mfc_style(&old.class).is_some_and(|s|mfc_style(&current.class).is_some_and(|v|s.eq_ignore_ascii_case(v))){return false}
+    if let (Some(a),Some(b))=(&old.identity,&current.identity) {
+        if a.pid==b.pid && a.created==b.created && a.hwnd!=b.hwnd{return false}
+    }
+    true
+}
+
+pub fn selection_token(hwnd:isize)->Result<(u32,Option<u64>),String>{
+    let mut pid=0;unsafe{GetWindowThreadProcessId(hwnd,&mut pid);}
+    if pid==0 || !selectable(hwnd){return Err("La finestra selezionata non è più disponibile o non è gestibile.".into())}
+    Ok((pid,crate::ipc::process_created(pid)))
+}
+pub fn save_one(hwnd:isize,token:(u32,Option<u64>))->Result<String,String>{save_one_to(hwnd,token,&db_path()?)}
+fn save_one_to(hwnd:isize,token:(u32,Option<u64>),path:&Path)->Result<String,String>{
+    let mut open:Vec<Live>=Vec::new();unsafe{EnumWindows(Some(window_cb),&mut open as *mut _ as isize);}
+    let selected_index=open.iter().position(|w|w.hwnd==hwnd).ok_or("La finestra selezionata non è più disponibile o non è gestibile.")?;
+    let mut pid=0;unsafe{GetWindowThreadProcessId(hwnd,&mut pid);}
+    if pid!=token.0 || token.1.is_some_and(|created|open[selected_index].identity.as_ref().map(|i|i.created)!=Some(created)) {
+        return Err("La finestra selezionata è cambiata durante la memorizzazione; configurazione conservata.".into());
+    }
+    if open[selected_index].class=="CabinetWClass" {
+        let folders=crate::explorer::capture()?;
+        for w in &mut open {if w.class=="CabinetWClass" {w.folder=folders.get(&w.hwnd).cloned();}}
+        if open[selected_index].folder.is_none(){return Err("Impossibile leggere la cartella della finestra di Esplora file selezionata; configurazione conservata.".into())}
+    }
+    let selected=&open[selected_index];let saved=saved_window(selected)?;
+    write_single_update(path,&open,selected,saved)?;
+    Ok("Finestra memorizzata nella configurazione predefinita.".into())
+}
+fn write_single_update(path:&Path,open:&[Live],selected:&Live,saved:Window)->Result<(),String>{
+    let mut layout=match fs::read(path){
+        Ok(data)=>serde_json::from_slice::<Layout>(&data).map_err(|e|format!("Configurazione non valida: {e}"))?,
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>Layout{version:1,windows:Vec::new()},
+        Err(e)=>return Err(format!("Impossibile leggere la configurazione: {e}")),
+    };
+    if layout.version!=1{return Err("Versione della configurazione non supportata; configurazione conservata.".into())}
+    update_one(&mut layout,&open,selected,saved)?;
+    let data=serde_json::to_vec_pretty(&layout).map_err(|e|e.to_string())?;
+    fs::create_dir_all(path.parent().ok_or("Cartella del file non valida")?).map_err(|e|e.to_string())?;
+    write_layout(path,&data)?;
+    Ok(())
+}
+
 pub fn save()->Result<String,String>{
     save_to(&db_path()?)
 }
@@ -110,6 +183,88 @@ fn write_layout(path: &Path, data: &[u8]) -> Result<(), String> {
     fn chrome_saved(title:&str,id:Option<WindowIdentity>)->Window{let mut w=saved();w.exe="C:\\Chrome\\chrome.exe".into();w.class="Chrome_WidgetWin_1".into();w.title=title.into();w.identity=id;w}
     fn chrome_live(hwnd:isize,title:&str,id:Option<WindowIdentity>)->Live{let mut w=live(hwnd,title,None);w.exe="C:\\Chrome\\chrome.exe".into();w.class="Chrome_WidgetWin_1".into();w.identity=id;w}
     fn id(hwnd:u64,created:u64)->WindowIdentity{WindowIdentity{hwnd,pid:42,created}}
+    #[test] fn single_update_replaces_only_the_selected_identity(){
+        let a=chrome_saved("Prima",Some(id(10,123)));let b=chrome_saved("Seconda",Some(id(20,123)));
+        let current=vec![chrome_live(10,"Titolo nuovo",Some(id(10,123))),chrome_live(20,"Seconda",Some(id(20,123)))];
+        let mut replacement=a.clone();replacement.title="Titolo nuovo".into();replacement.rect.left=250;
+        let mut layout=Layout{version:1,windows:vec![a,b]};update_one(&mut layout,&current,&current[0],replacement).unwrap();
+        assert_eq!(layout.windows.len(),2);assert_eq!(layout.windows[0].rect.left,250);assert_eq!(layout.windows[1].title,"Seconda");
+    }
+    #[test] fn single_update_tracks_explorer_even_after_navigation(){
+        let mut old=saved();old.class="CabinetWClass".into();old.folder=Some("C:\\old".into());old.identity=Some(id(10,123));
+        let mut current=live(10,"new",Some("C:\\new"));current.class=old.class.clone();current.identity=old.identity.clone();
+        let mut replacement=old.clone();replacement.folder=current.folder.clone();
+        let mut layout=Layout{version:1,windows:vec![old]};update_one(&mut layout,&[current.clone()],&current,replacement).unwrap();
+        assert_eq!(layout.windows.len(),1);assert_eq!(layout.windows[0].folder.as_deref(),Some("C:\\new"));
+    }
+    #[test] fn single_update_preserves_ambiguous_existing_entries(){
+        let first=chrome_saved("Scheda",None);let current=vec![chrome_live(10,"Scheda",None),chrome_live(20,"Scheda",None)];
+        let mut layout=Layout{version:1,windows:vec![first.clone(),first.clone()]};
+        assert!(update_one(&mut layout,&current,&current[0],first).is_err());assert_eq!(layout.windows.len(),2);
+    }
+    #[test] fn single_update_does_not_duplicate_an_unidentifiable_old_window(){
+        let old=chrome_saved("Titolo precedente",None);let current=chrome_live(20,"Titolo cambiato",None);
+        let mut layout=Layout{version:1,windows:vec![old.clone()]};let replacement=chrome_saved("Titolo cambiato",None);
+        assert!(update_one(&mut layout,&[current.clone()],&current,replacement).is_err());
+        assert_eq!(layout.windows.len(),1);assert_eq!(layout.windows[0].title,old.title);
+    }
+    #[test] fn single_update_appends_a_distinct_new_window(){
+        let first=chrome_saved("Prima",Some(id(10,123)));let current=vec![chrome_live(10,"Prima",Some(id(10,123))),chrome_live(20,"Nuova",Some(id(20,123)))];
+        let mut layout=Layout{version:1,windows:vec![first]};let replacement=chrome_saved("Nuova",Some(id(20,123)));
+        update_one(&mut layout,&current,&current[1],replacement).unwrap();assert_eq!(layout.windows.len(),2);assert_eq!(layout.windows[0].title,"Prima");
+    }
+    #[test] fn single_update_creates_file_and_preserves_invalid_file(){
+        let dir=std::env::temp_dir().join(format!("mydesktop-single-test-{}-{:?}",std::process::id(),std::thread::current().id()));
+        fs::create_dir(&dir).unwrap();let path=dir.join("layout.json");
+        let selected=chrome_live(10,"Prima",Some(id(10,123)));let entry=chrome_saved("Prima",selected.identity.clone());
+        write_single_update(&path,&[selected.clone()],&selected,entry.clone()).unwrap();
+        let layout:Layout=serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();assert_eq!(layout.windows.len(),1);
+        let invalid=b"{ invalid";fs::write(&path,invalid).unwrap();
+        assert!(write_single_update(&path,&[selected.clone()],&selected,entry).is_err());assert_eq!(fs::read(&path).unwrap(),invalid);
+        fs::remove_file(path).unwrap();fs::remove_dir(dir).unwrap();
+    }
+    #[test] fn single_update_leaves_ambiguous_file_unchanged(){
+        let dir=std::env::temp_dir().join(format!("mydesktop-ambiguous-test-{}-{:?}",std::process::id(),std::thread::current().id()));
+        fs::create_dir(&dir).unwrap();let path=dir.join("layout.json");
+        let old=chrome_saved("Scheda",None);let current=vec![chrome_live(10,"Scheda",None),chrome_live(20,"Scheda",None)];
+        let original=serde_json::to_vec(&Layout{version:1,windows:vec![old.clone(),old.clone()]}).unwrap();write_layout(&path,&original).unwrap();
+        assert!(write_single_update(&path,&current,&current[0],old).is_err());assert_eq!(fs::read(&path).unwrap(),original);
+        fs::remove_file(path).unwrap();fs::remove_dir(dir).unwrap();
+    }
+    #[test] #[ignore] fn single_window_test_child(){unsafe{
+        let Ok(dir)=std::env::var("MYDESKTOP_SINGLE_TEST_DIR") else{return};let dir=PathBuf::from(dir);
+        let name=crate::wide("myDesktopSingleSaveTestTarget");let instance=crate::GetModuleHandleW(std::ptr::null());
+        let class=crate::WndClassW{style:0,wnd_proc:Some(crate::DefWindowProcW),cls_extra:0,wnd_extra:0,instance,icon:std::ptr::null_mut(),cursor:std::ptr::null_mut(),background:std::ptr::null_mut(),menu_name:std::ptr::null(),class_name:name.as_ptr()};
+        assert_ne!(crate::RegisterClassW(&class),0);
+        let target=crate::CreateWindowExW(0x08000000,name.as_ptr(),crate::wide("myDesktop selection test").as_ptr(),0x80000000,60,60,20,20,std::ptr::null_mut(),std::ptr::null_mut(),instance,std::ptr::null_mut());
+        assert!(!target.is_null());assert_ne!(SetWindowPos(target as isize,-1,60,60,20,20,0x10|0x40),0);
+        fs::write(dir.join("ready"),(target as isize).to_string()).unwrap();
+        for _ in 0..200 {if dir.join("stop").exists(){break}std::thread::sleep(Duration::from_millis(25));}
+        crate::DestroyWindow(target);
+    }}
+    #[test] #[ignore] fn single_update_captures_real_external_window(){
+        use std::process::Stdio;
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard{fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
+        let dir=std::env::temp_dir().join(format!("mydesktop-real-single-{}",std::process::id()));fs::create_dir(&dir).unwrap();
+        let child=Command::new(std::env::current_exe().unwrap()).args(["--ignored","--exact","core::tests::single_window_test_child"])
+            .env("MYDESKTOP_SINGLE_TEST_DIR",&dir).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        let mut child=ChildGuard(child);
+        for _ in 0..100 {if dir.join("ready").exists(){break}std::thread::sleep(Duration::from_millis(25));}
+        let hwnd:usize=fs::read_to_string(dir.join("ready")).unwrap().parse().unwrap();let hwnd=hwnd as isize;
+        let token=selection_token(hwnd).unwrap();let path=dir.join("layout.json");
+        let untouched=saved();let initial=Layout{version:1,windows:vec![untouched.clone()]};
+        write_layout(&path,&serde_json::to_vec(&initial).unwrap()).unwrap();
+        save_one_to(hwnd,token,&path).unwrap();
+        let mut layout:Layout=serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();assert_eq!(layout.windows.len(),2);
+        assert_eq!(layout.windows[0].title,untouched.title);assert_eq!(layout.windows[1].identity.as_ref().unwrap().hwnd,hwnd as u64);
+        layout.windows[1].rect.left+=1000;write_layout(&path,&serde_json::to_vec(&layout).unwrap()).unwrap();
+        save_one_to(hwnd,token,&path).unwrap();
+        let updated:Layout=serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();assert_eq!(updated.windows.len(),2);
+        assert_eq!(updated.windows[0].title,untouched.title);assert_ne!(updated.windows[1].rect.left,layout.windows[1].rect.left);
+        fs::write(dir.join("stop"),b"").unwrap();child.0.wait().unwrap();
+        fs::remove_file(dir.join("stop")).unwrap();fs::remove_file(dir.join("ready")).unwrap();fs::remove_file(path).unwrap();fs::remove_dir(dir).unwrap();
+    }
     #[test] fn chrome_reordered_and_changed_titles_keep_their_own_handles(){
         let saved=vec![chrome_saved("Prima",Some(id(10,123))),chrome_saved("Seconda",Some(id(20,123)))];
         let live=vec![chrome_live(20,"Seconda",Some(id(20,123))),chrome_live(10,"Nuova scheda",Some(id(10,123)))];

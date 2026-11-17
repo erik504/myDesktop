@@ -55,6 +55,7 @@ static COMMAND: AtomicU32 = AtomicU32::new(0);
 }
 fn help(id:u32)->Option<&'static str> { Some(match id {
     1=>"Salva posizione, stato e monitor delle finestre aperte, sostituendo la configurazione predefinita precedente.",
+    10=>"Evidenzia una finestra passando col mouse: fai clic per salvarla nella configurazione predefinita, oppure premi Esc per annullare.",
     2=>"Ripristina la configurazione predefinita e prova a riaprire le finestre mancanti. Le app aggiuntive restano aperte.",
     8=>"Ripristina solo le finestre già aperte presenti nel salvataggio. Non avvia app e lascia intatte quelle aggiuntive.",
     9=>"Ripristina la configurazione e, dopo conferma, chiede di chiudere le app assenti dal salvataggio. Non chiude le finestre aggiuntive delle app salvate.",
@@ -157,7 +158,7 @@ pub unsafe fn destroy(owner:Handle){unsafe{
 }}
 
 #[cfg(test)] mod tests {use super::*;
-    #[test] fn all_commands_have_help(){for id in [1,2,3,4,5,6,7,8,9]{assert!(!help(id).unwrap().is_empty())}assert!(help(0).is_none());}
+    #[test] fn all_commands_have_help(){for id in [1,2,3,4,5,6,7,8,9,10]{assert!(!help(id).unwrap().is_empty())}assert!(help(0).is_none());}
     #[test] fn font_is_enlarged_by_half(){assert_eq!(scale_font_height(-12),-18);assert_eq!(scale_font_height(12),18);assert_eq!(scale_font_height(-11),-17);}
     #[test] fn positions_fit_work_area(){let work=Rect{left:-1000,top:0,right:0,bottom:800};let item=Rect{left:-200,top:780,right:-10,bottom:800};let(x,y)=position(item,work,250,50);assert!(x>=work.left&&x+250<=work.right&&y>=work.top&&y+50<=work.bottom);}
     // Explicitly opt in: the genuine Win32 modal menu briefly appears on the desktop.
@@ -188,7 +189,7 @@ pub unsafe fn destroy(owner:Handle){unsafe{
         assert_ne!(GetObjectW(GetStockObject(17),size_of::<LogFont>() as i32,(&mut base as *mut LogFont).cast()),0);
         assert_ne!(GetObjectW(FONT.load(Ordering::Relaxed) as Handle,size_of::<LogFont>() as i32,(&mut enlarged as *mut LogFont).cast()),0);
         assert_eq!(enlarged.height,scale_font_height(base.height));
-        for id in [1,2,3,4,5,6,7,8,9] {
+        for id in [1,2,3,4,5,6,7,8,9,10] {
             let (width,height)=text_size(tip,id,420).unwrap();
             let (actual_width,actual_height)=text_size(tip,id,width).unwrap();
             assert!(actual_width<=width && actual_height<=height,"Description {id} is clipped after resizing");

@@ -6,6 +6,7 @@ mod error_indicator;
 mod explorer;
 mod ipc;
 mod menu_help;
+mod picker;
 mod protected;
 mod spinner;
 mod startup;
@@ -140,6 +141,25 @@ fn start_job(hwnd: Handle, save: bool, path: Option<std::path::PathBuf>, mode:co
         tell(&format!("Impossibile avviare l'operazione: {e}"), true);
     }
 }
+fn begin_single_selection(hwnd:Handle){
+    if BUSY.swap(true,Ordering::AcqRel){tell("Un'operazione è già in corso. Attendi il completamento.",true);return}
+    unsafe {success::stop(hwnd);spinner::start(hwnd);}
+    if let Err(error)=unsafe{picker::begin(hwnd)} {
+        BUSY.store(false,Ordering::Release);unsafe{spinner::stop(hwnd);}tell(&error,true);
+    }
+}
+fn save_selected_window(hwnd:Handle,selected:isize){
+    let token=match core::selection_token(selected){Ok(token)=>token,Err(error)=>{
+        BUSY.store(false,Ordering::Release);unsafe{spinner::stop(hwnd);}tell(&error,true);return
+    }};
+    let target=hwnd as usize;
+    let started=std::thread::Builder::new().spawn(move||{
+        let result=std::panic::catch_unwind(||core::save_one(selected,token)).unwrap_or_else(|_|Err("Errore inatteso durante la memorizzazione della finestra.".into()));
+        *JOB_RESULT.lock().unwrap_or_else(|e|e.into_inner())=Some(JobCompletion::Standard(result));
+        if unsafe{PostMessageW(target as Handle,JOB_FINISHED,0,0)}==0{BUSY.store(false,Ordering::Release);}
+    });
+    if let Err(error)=started{BUSY.store(false,Ordering::Release);unsafe{spinner::stop(hwnd);}tell(&format!("Impossibile avviare la memorizzazione: {error}"),true);}
+}
 fn start_service_change(hwnd: Handle, install: bool) {
     if BUSY.swap(true, Ordering::AcqRel) { tell("Un'operazione è già in corso. Attendi il completamento.", true); return; }
     unsafe { success::stop(hwnd); spinner::start(hwnd); }
@@ -184,6 +204,7 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
             let menu = CreatePopupMenu();
             if !menu.is_null() {
                 AppendMenuW(menu, MF_STRING, 1, wide("Memorizza finestre").as_ptr());
+                AppendMenuW(menu, MF_STRING, 10, wide("Memorizza una finestra...").as_ptr());
                 AppendMenuW(menu, MF_STRING, 2, wide("Ripristina finestre").as_ptr());
                 AppendMenuW(menu, MF_STRING, 8, wide("Ripristina finestre (solo presenti)").as_ptr());
                 AppendMenuW(menu, MF_STRING, 9, wide("Ripristina finestre (chiudi estranee)").as_ptr());
@@ -203,6 +224,7 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
                 menu_help::hide(hwnd); DestroyMenu(menu); PostMessageW(hwnd, 0, 0, 0);
                 match command {
                     1 => start_job(hwnd, true, None,core::RestoreMode::Normal),
+                    10 => begin_single_selection(hwnd),
                     2 => start_job(hwnd, false, None,core::RestoreMode::Normal),
                     8 => start_job(hwnd, false, None,core::RestoreMode::Soft),
                     9 => {
@@ -222,6 +244,7 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
                             else { start_service_change(hwnd, !installed); }
                         }
                     },
+                    3 if picker::active() => {picker::stop(hwnd);BUSY.store(false,Ordering::Release);DestroyWindow(hwnd);},
                     3 if !BUSY.load(Ordering::Acquire) => { DestroyWindow(hwnd); },
                     3 => tell("Attendi il completamento dell'operazione prima di uscire.", true),
                     _ => ()
@@ -238,6 +261,7 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
         }
         WM_EXITMENULOOP => {menu_help::hide(hwnd);0}
         WM_TIMER if w == menu_help::TIMER => {menu_help::show(hwnd);0}
+        WM_TIMER if w == picker::TIMER => {picker::tick(hwnd);0}
         WM_TIMER if w == spinner::TIMER_ID => {
             if BUSY.load(Ordering::Acquire) { spinner::tick(hwnd); } else { spinner::stop(hwnd); if error_indicator::active(){error_indicator::draw(hwnd);} }
             0
@@ -261,7 +285,15 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
             }
             0
         }
-        WM_DESTROY => { menu_help::destroy(hwnd); success::stop(hwnd); spinner::stop(hwnd); Shell_NotifyIconW(NIM_DELETE, &mut tray_data(hwnd)); PostQuitMessage(0); 0 }
+        picker::FINISHED => {
+            if !picker::active(){return 0}
+            picker::stop(hwnd);
+            if w==1 && l!=0 {save_selected_window(hwnd,l)} else {
+                BUSY.store(false,Ordering::Release);spinner::stop(hwnd);if error_indicator::active(){error_indicator::draw(hwnd);}
+            }
+            0
+        }
+        WM_DESTROY => { picker::stop(hwnd); menu_help::destroy(hwnd); success::stop(hwnd); spinner::stop(hwnd); Shell_NotifyIconW(NIM_DELETE, &mut tray_data(hwnd)); PostQuitMessage(0); 0 }
         _ => DefWindowProcW(hwnd, msg, w, l),
     }
 }
