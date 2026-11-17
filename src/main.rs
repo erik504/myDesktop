@@ -5,7 +5,6 @@ mod dialogs;
 mod error_indicator;
 mod explorer;
 mod ipc;
-mod menu_help;
 mod protected;
 mod spinner;
 mod startup;
@@ -28,8 +27,6 @@ const WM_COMMAND: u32 = 0x111;
 const WM_CONTEXTMENU: u32 = 0x7b;
 const WM_RBUTTONUP: u32 = 0x205;
 const WM_TIMER: u32 = 0x113;
-const WM_MENUSELECT:u32=0x11f;
-const WM_EXITMENULOOP:u32=0x212;
 const WM_APP: u32 = 0x8000;
 const TRAY_CALLBACK: u32 = WM_APP + 1;
 const JOB_FINISHED: u32 = WM_APP + 2;
@@ -194,12 +191,13 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
                 let incomplete=matches!((&startup_status,&service_status),(Ok(a),Ok(b)) if a!=b);
                 let startup_label=if incomplete {"Avvia con Windows (configurazione incompleta)"} else {"Avvia con Windows"};
                 AppendMenuW(menu, MF_STRING | if matches!(startup_status, Ok(true)) || matches!(service_status, Ok(true)) { MF_CHECKED } else { 0 }, 5, wide(startup_label).as_ptr());
+                AppendMenuW(menu, MF_STRING, 10, wide("Guida ai comandi").as_ptr());
                 AppendMenuW(menu, MF_STRING, 4, wide("Informazioni sulla versione").as_ptr());
                 AppendMenuW(menu, MF_SEPARATOR, 0, null());
                 AppendMenuW(menu, MF_STRING, 3, wide("Esci").as_ptr());
                 let mut p = Point { x: 0, y: 0 }; GetCursorPos(&mut p); SetForegroundWindow(hwnd);
                 let command = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, p.x, p.y, 0, hwnd, null());
-                menu_help::hide(hwnd); DestroyMenu(menu); PostMessageW(hwnd, 0, 0, 0);
+                DestroyMenu(menu); PostMessageW(hwnd, 0, 0, 0);
                 match command {
                     1 => start_job(hwnd, true, None,core::RestoreMode::Normal),
                     2 => start_job(hwnd, false, None,core::RestoreMode::Normal),
@@ -213,6 +211,7 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
                         else { match dialogs::choose(hwnd, command==6) { Ok(Some(path)) => start_job(hwnd, command==6, Some(path),core::RestoreMode::Normal), Ok(None) => (), Err(e) => tell(&e,true) } }
                     },
                     4 => tell(concat!("myDesktop ", env!("MYDESKTOP_VERSION"), "\nData di compilazione: ", env!("MYDESKTOP_BUILD_DATE")), false),
+                    10 => tell("Memorizza finestre: salva la configurazione predefinita.\n\nRipristina finestre: ripristina la configurazione e riapre le finestre mancanti quando possibile.\n\nSolo presenti: ripristina solo le finestre già aperte.\n\nChiudi estranee: ripristina e chiede di chiudere le app assenti dal salvataggio.\n\nMemorizza come / Ripristina da: salva o apre una configurazione scelta.\n\nAvvia con Windows: gestisce l'avvio al login e il servizio.\n\nEsci: chiude myDesktop lasciando attivo il servizio installato.",false),
                     5 => match (startup_status,service_status) {
                         (Err(e),_) | (_,Err(e)) => tell(&e,true),
                         (Ok(startup),Ok(installed)) => {
@@ -229,9 +228,6 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
             0
         }
         WM_COMMAND => 0,
-        WM_MENUSELECT => {let flags=((w>>16)&0xffff) as u32;if l==0 || flags==0xffff || flags&0x810!=0 {menu_help::hide(hwnd);} else {menu_help::select(hwnd,l as Handle,(w&0xffff) as u32);} 0}
-        WM_EXITMENULOOP => {menu_help::hide(hwnd);0}
-        WM_TIMER if w == menu_help::TIMER => {menu_help::show(hwnd);0}
         WM_TIMER if w == spinner::TIMER_ID => {
             if BUSY.load(Ordering::Acquire) { spinner::tick(hwnd); } else { spinner::stop(hwnd); if error_indicator::active(){error_indicator::draw(hwnd);} }
             0
@@ -255,7 +251,7 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
             }
             0
         }
-        WM_DESTROY => { menu_help::destroy(hwnd); success::stop(hwnd); spinner::stop(hwnd); Shell_NotifyIconW(NIM_DELETE, &mut tray_data(hwnd)); PostQuitMessage(0); 0 }
+        WM_DESTROY => { success::stop(hwnd); spinner::stop(hwnd); Shell_NotifyIconW(NIM_DELETE, &mut tray_data(hwnd)); PostQuitMessage(0); 0 }
         _ => DefWindowProcW(hwnd, msg, w, l),
     }
 }
