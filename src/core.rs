@@ -22,7 +22,7 @@ struct Rect { left: i32, top: i32, right: i32, bottom: i32 }
     fn GetWindowRect(hwnd: Hwnd, r: *mut std::ffi::c_void) -> i32;
     fn MonitorFromWindow(hwnd: Hwnd, flags: u32) -> isize;
     fn EnumDisplayMonitors(dc: isize, clip: *const Rect, cb: Option<unsafe extern "system" fn(isize,isize,*mut Rect,isize)->i32>, arg: isize) -> i32;
-    fn GetMonitorInfoW(m: isize, info: *mut MonitorInfo) -> i32;
+    fn GetMonitorInfoW(m: isize, info: *mut std::ffi::c_void) -> i32;
     fn EnumDisplayDevicesW(device: *const u16, index: u32, display: *mut DisplayDevice, flags: u32) -> i32;
     fn SetWindowPos(hwnd: Hwnd, after: Hwnd, x: i32, y: i32, w: i32, h: i32, flags: u32) -> i32;
     fn ShowWindow(hwnd: Hwnd, cmd: i32) -> i32;
@@ -48,7 +48,7 @@ fn db_path() -> Result<PathBuf,String> { let p=std::env::var_os("APPDATA").ok_or
 
 unsafe fn monitor_data(h: isize) -> Option<Monitor> { unsafe {
     let mut mi: MonitorInfo=zeroed(); mi.size=size_of::<MonitorInfo>() as u32;
-    if GetMonitorInfoW(h, &mut mi)==0 { return None; }
+    if GetMonitorInfoW(h, (&mut mi as *mut MonitorInfo).cast())==0 { return None; }
     let device=text(&mi.device);
     let mut dd: DisplayDevice=zeroed(); dd.size=size_of::<DisplayDevice>() as u32;
     let id=if EnumDisplayDevicesW(mi.device.as_ptr(),0,&mut dd,0)!=0 { let key=text(&dd.key); if key.is_empty(){text(&dd.id)} else {key} } else { String::new() };

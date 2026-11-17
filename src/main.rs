@@ -5,6 +5,7 @@ mod dialogs;
 mod error_indicator;
 mod explorer;
 mod ipc;
+mod menu_help;
 mod protected;
 mod spinner;
 mod startup;
@@ -27,6 +28,8 @@ const WM_COMMAND: u32 = 0x111;
 const WM_CONTEXTMENU: u32 = 0x7b;
 const WM_RBUTTONUP: u32 = 0x205;
 const WM_TIMER: u32 = 0x113;
+const WM_MENUSELECT:u32=0x11f;
+const WM_EXITMENULOOP:u32=0x212;
 const WM_APP: u32 = 0x8000;
 const TRAY_CALLBACK: u32 = WM_APP + 1;
 const JOB_FINISHED: u32 = WM_APP + 2;
@@ -182,8 +185,8 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
             if !menu.is_null() {
                 AppendMenuW(menu, MF_STRING, 1, wide("Memorizza finestre").as_ptr());
                 AppendMenuW(menu, MF_STRING, 2, wide("Ripristina finestre").as_ptr());
-                AppendMenuW(menu, MF_STRING, 8, wide("Ripristina finestre (soft)").as_ptr());
-                AppendMenuW(menu, MF_STRING, 9, wide("Ripristina finestre (hard)").as_ptr());
+                AppendMenuW(menu, MF_STRING, 8, wide("Ripristina finestre (solo presenti)").as_ptr());
+                AppendMenuW(menu, MF_STRING, 9, wide("Ripristina finestre (chiudi estranee)").as_ptr());
                 AppendMenuW(menu, MF_STRING, 6, wide("Memorizza finestre come...").as_ptr());
                 AppendMenuW(menu, MF_STRING, 7, wide("Ripristina finestre da...").as_ptr());
                 let service_status=service::is_installed();
@@ -196,14 +199,14 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
                 AppendMenuW(menu, MF_STRING, 3, wide("Esci").as_ptr());
                 let mut p = Point { x: 0, y: 0 }; GetCursorPos(&mut p); SetForegroundWindow(hwnd);
                 let command = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, p.x, p.y, 0, hwnd, null());
-                DestroyMenu(menu); PostMessageW(hwnd, 0, 0, 0);
+                menu_help::hide(hwnd); DestroyMenu(menu); PostMessageW(hwnd, 0, 0, 0);
                 match command {
                     1 => start_job(hwnd, true, None,core::RestoreMode::Normal),
                     2 => start_job(hwnd, false, None,core::RestoreMode::Normal),
                     8 => start_job(hwnd, false, None,core::RestoreMode::Soft),
                     9 => {
                         if BUSY.load(Ordering::Acquire) {tell("Un'operazione è già in corso. Attendi il completamento.",true);}
-                        else if MessageBoxW(hwnd,wide("Il ripristino hard richiederà la chiusura delle app non presenti nel salvataggio. Le app potranno chiederti di salvare le modifiche. Continuare?").as_ptr(),wide("myDesktop - ripristino hard").as_ptr(),0x134)==6 {start_job(hwnd,false,None,core::RestoreMode::Hard);}
+                        else if MessageBoxW(hwnd,wide("Il ripristino richiederà la chiusura delle app non presenti nel salvataggio. Le app potranno chiederti di salvare le modifiche. Continuare?").as_ptr(),wide("myDesktop - chiudi estranee").as_ptr(),0x134)==6 {start_job(hwnd,false,None,core::RestoreMode::Hard);}
                     },
                     6 | 7 => {
                         if BUSY.load(Ordering::Acquire) { tell("Un'operazione è già in corso. Attendi il completamento.", true); }
@@ -226,6 +229,9 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
             0
         }
         WM_COMMAND => 0,
+        WM_MENUSELECT => {let flags=((w>>16)&0xffff) as u32;if l==0 || flags==0xffff || flags&0x810!=0 {menu_help::hide(hwnd);} else {menu_help::select(hwnd,l as Handle,(w&0xffff) as u32);} 0}
+        WM_EXITMENULOOP => {menu_help::hide(hwnd);0}
+        WM_TIMER if w == menu_help::TIMER => {menu_help::show(hwnd);0}
         WM_TIMER if w == spinner::TIMER_ID => {
             if BUSY.load(Ordering::Acquire) { spinner::tick(hwnd); } else { spinner::stop(hwnd); if error_indicator::active(){error_indicator::draw(hwnd);} }
             0
@@ -249,7 +255,7 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
             }
             0
         }
-        WM_DESTROY => { success::stop(hwnd); spinner::stop(hwnd); Shell_NotifyIconW(NIM_DELETE, &mut tray_data(hwnd)); PostQuitMessage(0); 0 }
+        WM_DESTROY => { menu_help::destroy(hwnd); success::stop(hwnd); spinner::stop(hwnd); Shell_NotifyIconW(NIM_DELETE, &mut tray_data(hwnd)); PostQuitMessage(0); 0 }
         _ => DefWindowProcW(hwnd, msg, w, l),
     }
 }
