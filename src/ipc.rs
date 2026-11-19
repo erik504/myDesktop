@@ -12,6 +12,9 @@ const TOKEN_SESSION: u32 = 12;
 const TOKEN_ELEVATION: u32 = 20;
 const REQ_SIZE: usize = 52;
 const MAGIC: &[u8;4] = b"MDW1";
+// The installed helper exposes one pipe instance; parallel restores must not
+// race each other for that single connection.
+static MOVE_LOCK:std::sync::Mutex<()>=std::sync::Mutex::new(());
 
 #[repr(C)] #[derive(Default,Clone,Copy)] struct FileTime { low:u32, high:u32 }
 #[repr(C)] #[derive(Default,Clone,Copy)] struct Luid { low:u32, high:i32 }
@@ -125,7 +128,7 @@ pub fn serve()->Result<(),String>{unsafe{
 }}
 
 /// Request a placement from the authenticated elevated helper.
-pub fn move_window(hwnd:isize,x:i32,y:i32,w:i32,h:i32,show:u32)->Result<(),String>{unsafe{
+pub fn move_window(hwnd:isize,x:i32,y:i32,w:i32,h:i32,show:u32)->Result<(),String>{let _guard=MOVE_LOCK.lock().unwrap_or_else(|e|e.into_inner());unsafe{
  let me=current()?;let mut pid=0;if GetWindowThreadProcessId(hwnd,&mut pid)==0{return Err("Finestra non valida".into())}let(_,target,created)=process_identity(pid)?;if !same_user(&me,&target){return Err("Finestra di un altro utente".into())}let state=if show==3{1}else if [2,6,7,11].contains(&show){2}else{0};let req=Request{hwnd:hwnd as u64,pid,created,x,y,w,h,show:state};let bytes=encode(req);decode(&bytes)?;
  let name=pipe_name(me.session);WaitNamedPipeW(name.as_ptr(),1000);let pipe=own(CreateFileW(name.as_ptr(),0x80000002,0,null(),3,0,null_mut())).map_err(|_|"Servizio privilegiato non disponibile".to_string())?;let mut server_pid=0;if GetNamedPipeServerProcessId(pipe.0,&mut server_pid)==0{return Err(last("Server non identificato"))}let(server,server_id,_)=process_identity(server_pid)?;if !same_user(&me,&server_id)||!server_id.elevated||!process_path(server.0)?.eq_ignore_ascii_case(&installed_path()?){return Err("Servizio non autenticato".into())}let mut n=0;if WriteFile(pipe.0,bytes.as_ptr().cast(),bytes.len() as u32,&mut n,null_mut())==0||n as usize!=bytes.len(){return Err(last("Invio richiesta fallito"))}let until=Instant::now()+Duration::from_secs(8);let mut available=0;while Instant::now()<until&&PeekNamedPipe(pipe.0,null_mut(),0,null_mut(),&mut available,null_mut())!=0&&available<4 {thread::sleep(Duration::from_millis(25));}let mut answer=[0u8;4];if available<4||ReadFile(pipe.0,answer.as_mut_ptr().cast(),4,&mut n,null_mut())==0||n!=4{return Err("Risposta del servizio assente o non valida".into())}let ack=[1u8];WriteFile(pipe.0,ack.as_ptr().cast(),1,&mut n,null_mut());if u32::from_le_bytes(answer)!=0{return Err("Il servizio ha rifiutato la richiesta di spostamento".into())}Ok(())
 }}

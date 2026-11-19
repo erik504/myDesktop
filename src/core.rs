@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, fs, io::Write, mem::{size_of, zeroed}, os::windows::ffi::OsStrExt, path::{Path, PathBuf}, process::Command, sync::atomic::{AtomicU64, Ordering}, thread, time::Duration};
+use std::{collections::HashSet, fs, io::Write, mem::{size_of, zeroed}, os::windows::ffi::OsStrExt, path::{Path, PathBuf}, sync::atomic::{AtomicU64, Ordering}, thread, time::Duration};
+#[cfg(test)] use std::process::Command;
 
 type Hwnd = isize;
 #[repr(C)] #[derive(Clone, Copy, Default, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -8,6 +9,8 @@ struct Rect { left: i32, top: i32, right: i32, bottom: i32 }
 #[repr(C)] #[derive(Clone, Copy)] struct Placement { length: u32, flags: u32, show: u32, min: Point, max: Point, normal: Rect }
 #[repr(C)] struct MonitorInfo { size: u32, monitor: Rect, work: Rect, flags: u32, device: [u16; 32] }
 #[repr(C)] struct DisplayDevice { size: u32, name: [u16; 32], string: [u16; 128], flags: u32, id: [u16; 128], key: [u16; 128] }
+#[repr(C)] struct StartupInfo {size:u32,reserved:*mut u16,desktop:*mut u16,title:*mut u16,x:u32,y:u32,width:u32,height:u32,x_chars:u32,y_chars:u32,fill:u32,flags:u32,show:u16,reserved2_len:u16,reserved2:*mut u8,stdin:*mut std::ffi::c_void,stdout:*mut std::ffi::c_void,stderr:*mut std::ffi::c_void}
+#[repr(C)] struct ProcessInfo {process:*mut std::ffi::c_void,thread:*mut std::ffi::c_void,pid:u32,tid:u32}
 
 #[link(name="user32")] unsafe extern "system" {
     fn EnumWindows(cb: Option<unsafe extern "system" fn(Hwnd, isize) -> i32>, arg: isize) -> i32;
@@ -33,6 +36,7 @@ struct Rect { left: i32, top: i32, right: i32, bottom: i32 }
     fn QueryFullProcessImageNameW(process: *mut std::ffi::c_void, flags: u32, path: *mut u16, size: *mut u32) -> i32;
     fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
     fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
+    fn CreateProcessW(application:*const u16,command:*mut u16,process_attrs:*mut std::ffi::c_void,thread_attrs:*mut std::ffi::c_void,inherit:i32,flags:u32,environment:*mut std::ffi::c_void,directory:*const u16,startup:*mut StartupInfo,info:*mut ProcessInfo)->i32;
 }
 #[link(name="dwmapi")] unsafe extern "system" { fn DwmGetWindowAttribute(hwnd: Hwnd, attr: u32, value: *mut u32, size: u32) -> i32; }
 #[link(name="shell32")] unsafe extern "system" { fn ShellExecuteW(hwnd: Hwnd, operation: *const u16, file: *const u16, parameters: *const u16, directory: *const u16, show: i32) -> isize; }
@@ -72,7 +76,8 @@ unsafe extern "system" fn window_cb(h:Hwnd,arg:isize)->i32 { unsafe {
     let identity=crate::ipc::process_created(pid).map(|created|WindowIdentity{hwnd:h as u64,pid,created});
     (*(arg as *mut Vec<Live>)).push(Live{ hwnd:h,exe,class,title,folder:None,monitor,rect:r,show:wp.show,identity }); 1
 } }
-fn windows()->Result<Vec<Live>,String>{ let mut v:Vec<Live>=Vec::new(); unsafe{EnumWindows(Some(window_cb),&mut v as *mut _ as isize);} let folders=crate::explorer::capture()?; for w in &mut v { w.folder=folders.get(&w.hwnd).cloned(); if w.class=="CabinetWClass" && w.folder.is_none(){return Err(format!("Impossibile leggere la cartella di Esplora file: {}",w.title));} } Ok(v) }
+fn raw_windows()->Vec<Live>{let mut v:Vec<Live>=Vec::new();unsafe{EnumWindows(Some(window_cb),&mut v as *mut _ as isize);}v}
+fn windows()->Result<Vec<Live>,String>{ let mut v=raw_windows(); if v.iter().any(|w|w.class=="CabinetWClass"){let folders=crate::explorer::capture()?;for w in &mut v {w.folder=folders.get(&w.hwnd).cloned();if w.class=="CabinetWClass" && w.folder.is_none(){return Err(format!("Impossibile leggere la cartella di Esplora file: {}",w.title));}}} Ok(v) }
 
 /// The picker uses the same eligibility rules as the normal save operation.
 pub fn selectable(hwnd:isize)->bool {
@@ -175,6 +180,26 @@ fn write_layout(path: &Path, data: &[u8]) -> Result<(), String> {
     fn saved()->Window{Window{exe:"C:\\App.exe".into(),class:"Class".into(),title:"first".into(),folder:None,monitor_id:"physical-A".into(),monitor_device:"display1".into(),rect:Rect::default(),show:1,identity:None}}
     fn live(hwnd:isize,title:&str,folder:Option<&str>)->Live{Live{hwnd,exe:"c:\\app.exe".into(),class:"Class".into(),title:title.into(),folder:folder.map(str::to_owned),monitor:0,rect:Rect::default(),show:1,identity:None}}
     #[test] fn selects_saved_physical_monitor_and_falls_back_to_primary(){let ms=vec![monitor("physical-B","display1",true),monitor("physical-A","display2",false)];let mut s=saved();assert_eq!(target(&s,&ms).unwrap().device,"display2");s.monitor_id="missing".into();assert_eq!(target(&s,&ms).unwrap().device,"display1");}
+    #[test] fn missing_apps_are_grouped_and_soft_mode_never_launches(){
+        let mut a=saved();a.title="A".into();let mut b=a.clone();b.title="B".into();
+        let mut explorer=a.clone();explorer.exe="C:\\Windows\\explorer.exe".into();explorer.folder=Some("C:\\uno".into());
+        let mut explorer2=explorer.clone();explorer2.folder=Some("C:\\due".into());
+        let ms=vec![monitor("physical-A","display1",true)];let all=vec![a,b,explorer,explorer2];
+        let (plans,pending,skipped,failed)=launch_plans(&all,&[],&[None;4],RestoreMode::Normal,&ms);
+        assert_eq!(plans.len(),3);assert_eq!(plans[0].indices,vec![0,1]);assert_eq!(plans[1].indices,vec![2]);assert_eq!(plans[2].indices,vec![3]);
+        assert!(pending.iter().all(|p|*p));assert_eq!(skipped,0);assert!(failed.is_empty());
+        let (plans,pending,skipped,failed)=launch_plans(&all,&[],&[None;4],RestoreMode::Soft,&ms);
+        assert!(plans.is_empty());assert!(pending.iter().all(|p|!*p));assert_eq!(skipped,4);assert!(failed.is_empty());
+    }
+    #[test] fn existing_app_is_not_relaunched_for_an_unidentified_window(){
+        let s=saved();let open=vec![live(10,"unrelated",None)];let ms=vec![monitor("physical-A","display1",true)];
+        let (plans,pending,_,failed)=launch_plans(&[s],&open,&[None],RestoreMode::Normal,&ms);
+        assert!(plans.is_empty());assert_eq!(pending,vec![false]);assert_eq!(failed.len(),1);
+    }
+    #[test] fn startup_hints_include_size_and_negative_monitor_coordinates(){
+        let r=Rect{left:-1500,top:35,right:-900,bottom:435};let startup=startup_for(r);
+        assert_eq!(startup.flags&6,6);assert_eq!(startup.x as i32,-1500);assert_eq!(startup.y,35);assert_eq!((startup.width,startup.height),(600,400));
+    }
     #[test] fn matches_title_and_never_reuses_window(){let s=saved();let a=vec![live(1,"other",None),live(2,"first",None)];let mut used=HashSet::new();assert_eq!(plan_matches(&[s.clone()],&a,&used),vec![Some(2)]);used.insert(2);assert_eq!(plan_matches(&[s],&a,&used),vec![None]);}
     #[test] fn matches_explorer_folder(){let mut s=saved();s.folder=Some("C:\\folder".into());let a=vec![live(1,"first",Some("C:\\other")),live(2,"first",Some("c:\\FOLDER"))];assert_eq!(plan_matches(&[s],&a,&HashSet::new()),vec![Some(2)]);}
     #[test] fn matches_mfc_changed_handles_only_for_same_style_and_title(){let mut s=saved();s.class="Afx:00400000:28:00010007:00000000:00000000".into();let mut w=live(1,"first",None);w.class="Afx:00700000:28:00020007:00000000:00000000".into();assert!(matches(&s,&w));w.title="another".into();assert!(!matches(&s,&w));w.title="first".into();w.class="Afx:00700000:29:00020007:00000000:00000000".into();assert!(!matches(&s,&w));}
@@ -264,6 +289,42 @@ fn write_layout(path: &Path, data: &[u8]) -> Result<(), String> {
         assert_eq!(updated.windows[0].title,untouched.title);assert_ne!(updated.windows[1].rect.left,layout.windows[1].rect.left);
         fs::write(dir.join("stop"),b"").unwrap();child.0.wait().unwrap();
         fs::remove_file(dir.join("stop")).unwrap();fs::remove_file(dir.join("ready")).unwrap();fs::remove_file(path).unwrap();fs::remove_dir(dir).unwrap();
+    }
+    #[test] #[ignore] fn parallel_restore_starts_real_apps_and_preserves_extra(){
+        #[link(name="kernel32")] unsafe extern "system" {fn SetErrorMode(mode:u32)->u32;}
+        unsafe{SetErrorMode(2);}
+        struct Cleanup{dir:PathBuf,exes:Vec<String>}
+        impl Drop for Cleanup{fn drop(&mut self){
+            for _ in 0..100 {let windows:Vec<_>=raw_windows().into_iter().filter(|w|self.exes.iter().any(|e|equivalent(e,&w.exe))).collect();
+                if windows.is_empty(){break}for w in windows{unsafe{crate::PostMessageW(w.hwnd as *mut std::ffi::c_void,0x10,0,0);}}thread::sleep(Duration::from_millis(30));}
+            for name in ["fixture_base.exe","md_restore_a.exe","md_restore_b.exe","md_restore_extra.exe","layout.json"] {let _=fs::remove_file(self.dir.join(name));}
+            for name in ["md_restore_a","md_restore_b","md_restore_extra"]{for suffix in ["started","initial","shown","changes"]{let _=fs::remove_file(self.dir.join(format!("{name}.{suffix}")));}}
+            let _=fs::remove_dir(&self.dir);
+        }}
+        let dir=std::env::temp_dir().join(format!("mydesktop-parallel-test-{}",std::process::id()));fs::create_dir(&dir).unwrap();
+        let names=["md_restore_a","md_restore_b","md_restore_extra"];
+        let exes:Vec<_>=names.iter().map(|n|dir.join(format!("{n}.exe"))).collect();
+        let cleanup=Cleanup{dir:dir.clone(),exes:exes.iter().map(|p|p.to_string_lossy().into_owned()).collect()};
+        let fixture=Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/restore_app.rs");let base=dir.join("fixture_base.exe");
+        let status=Command::new("rustc").args(["--edition=2021","-C","opt-level=1"]).arg(fixture).arg("-o").arg(&base).status().unwrap();assert!(status.success());
+        for exe in &exes {fs::copy(&base,exe).unwrap();}
+        let _extra=Command::new(&exes[2]).spawn().unwrap();
+        for _ in 0..120{if dir.join("md_restore_extra.shown").exists(){break}thread::sleep(Duration::from_millis(25));}
+        let extra=raw_windows().into_iter().find(|w|equivalent(&w.exe,&cleanup.exes[2])).expect("Finestra di test aggiuntiva non disponibile");
+        let ms=monitors();let m=ms.iter().find(|m|m.primary).unwrap();
+        let make=|index:usize,left:i32|Window{exe:cleanup.exes[index].clone(),class:"myDesktopRestoreFixture".into(),title:names[index].into(),folder:None,monitor_id:m.id.clone(),monitor_device:m.device.clone(),rect:Rect{left,top:80,right:left+300,bottom:240},show:1,identity:None};
+        let saved=vec![make(0,80),make(1,420)];let expected_a=destination(&saved[0],&ms).unwrap();let expected_b=destination(&saved[1],&ms).unwrap();
+        let path=dir.join("layout.json");fs::write(&path,serde_json::to_vec(&Layout{version:1,windows:saved}).unwrap()).unwrap();
+        restore_from_mode(&path,RestoreMode::Normal).unwrap();
+        let timestamp=|name:&str,suffix:&str|->u128{fs::read_to_string(dir.join(format!("{name}.{suffix}"))).unwrap().parse().unwrap()};
+        assert!(timestamp(names[0],"started").max(timestamp(names[1],"started"))<timestamp(names[0],"shown").min(timestamp(names[1],"shown")),"Gli avvii sono stati seriali");
+        let parse_rect=|name:&str|{let text=fs::read_to_string(dir.join(format!("{name}.initial"))).unwrap();let values:Vec<i32>=text.split_whitespace().map(|v|v.parse().unwrap()).collect();Rect{left:values[0],top:values[1],right:values[2],bottom:values[3]}};
+        assert_eq!(parse_rect(names[0]),expected_a,"I suggerimenti per la posizione iniziale non sono stati applicati");
+        let current=raw_windows();let a=current.iter().find(|w|equivalent(&w.exe,&cleanup.exes[0])).unwrap();let b=current.iter().find(|w|equivalent(&w.exe,&cleanup.exes[1])).unwrap();
+        assert_eq!(a.rect,expected_a);assert_eq!(b.rect,expected_b);
+        let moves=fs::read_to_string(dir.join("md_restore_b.changes")).unwrap().parse::<usize>().unwrap();assert_eq!(moves,1,"La finestra riaperta è stata animata");
+        let kept=current.iter().find(|w|w.hwnd==extra.hwnd).expect("La finestra aggiuntiva è stata chiusa");assert_eq!(kept.rect,extra.rect);
+        drop(cleanup);
     }
     #[test] fn chrome_reordered_and_changed_titles_keep_their_own_handles(){
         let saved=vec![chrome_saved("Prima",Some(id(10,123))),chrome_saved("Seconda",Some(id(20,123)))];
@@ -399,19 +460,29 @@ fn guard_live_windows(initial:&[Live],current:&mut [Live],launched:&HashSet<Hwnd
         }
     }
 }
-fn launch_application(exe:&str)->Result<(),String>{
-    let mut command=Command::new(exe);
-    if let Some(parent)=Path::new(exe).parent(){command.current_dir(parent);}
-    match command.spawn(){
-        Ok(_)=>Ok(()),
-        Err(e) if e.raw_os_error()==Some(740)=>{
+fn startup_for(rect:Rect)->StartupInfo {
+    let mut startup:StartupInfo=unsafe{zeroed()};startup.size=size_of::<StartupInfo>() as u32;
+    startup.flags=0x4|0x2; // STARTF_USEPOSITION | STARTF_USESIZE
+    startup.x=rect.left as u32;startup.y=rect.top as u32;
+    startup.width=(rect.right-rect.left).max(1) as u32;startup.height=(rect.bottom-rect.top).max(1) as u32;
+    startup
+}
+fn launch_application(exe:&str,rect:Rect)->Result<(),String>{
+    if exe.contains('"'){return Err("Percorso eseguibile non valido".into())}
+    let file:Vec<u16>=std::ffi::OsStr::new(exe).encode_wide().chain(Some(0)).collect();
+    let mut command:Vec<u16>=format!("\"{exe}\"").encode_utf16().chain(Some(0)).collect();
+    let directory:Option<Vec<u16>>=Path::new(exe).parent().map(|p|p.as_os_str().encode_wide().chain(Some(0)).collect());
+    let mut startup=startup_for(rect);let mut info:ProcessInfo=unsafe{zeroed()};
+    let ok=unsafe{CreateProcessW(file.as_ptr(),command.as_mut_ptr(),std::ptr::null_mut(),std::ptr::null_mut(),0,0,std::ptr::null_mut(),directory.as_ref().map_or(std::ptr::null(),|p|p.as_ptr()),&mut startup,&mut info)};
+    if ok!=0 {unsafe{CloseHandle(info.thread);CloseHandle(info.process);}return Ok(())}
+    let e=std::io::Error::last_os_error();
+    match e.raw_os_error(){
+        Some(740)=>{
             // The Windows shell performs the normal UAC consent flow when needed.
-            let file:Vec<u16>=std::ffi::OsStr::new(exe).encode_wide().chain(Some(0)).collect();
-            let directory:Option<Vec<u16>>=Path::new(exe).parent().map(|p|p.as_os_str().encode_wide().chain(Some(0)).collect());
             let result=unsafe{ShellExecuteW(0,std::ptr::null(),file.as_ptr(),std::ptr::null(),directory.as_ref().map_or(std::ptr::null(),|p|p.as_ptr()),1)};
             if result>32 {Ok(())} else {Err(format!("Avvio con richiesta di autorizzazione non riuscito (codice {result}): {exe}"))}
         },
-        Err(e)=>Err(format!("Impossibile avviare {exe}: {e}")),
+        _=>Err(format!("Impossibile avviare {exe}: {e}")),
     }
 }
 fn target<'a>(w:&Window,monitors:&'a [Monitor])->Option<&'a Monitor>{
@@ -419,8 +490,26 @@ fn target<'a>(w:&Window,monitors:&'a [Monitor])->Option<&'a Monitor>{
     let by_id=if w.monitor_id.is_empty(){None}else{monitors.iter().find(|m|m.id.eq_ignore_ascii_case(&w.monitor_id))};
     by_id.or_else(||if w.monitor_id.is_empty(){monitors.iter().find(|m|m.device.eq_ignore_ascii_case(&w.monitor_device))}else{None}).or_else(||monitors.iter().find(|m|m.primary)).or_else(||monitors.first())
 }
+fn destination(w:&Window,monitors:&[Monitor])->Option<Rect>{
+    let m=target(w,monitors)?;let r=w.rect;let mut x=m.rect.left+r.left;let mut y=m.rect.top+r.top;
+    let mut width=(r.right-r.left).max(1);let mut height=(r.bottom-r.top).max(1);
+    let same=if w.monitor_id.is_empty(){m.device.eq_ignore_ascii_case(&w.monitor_device)}else{m.id.eq_ignore_ascii_case(&w.monitor_id)};
+    if !same {width=width.min(m.work.right-m.work.left);height=height.min(m.work.bottom-m.work.top);x=x.clamp(m.work.left,m.work.right-width);y=y.clamp(m.work.top,m.work.bottom-height);}
+    Some(Rect{left:x,top:y,right:x+width,bottom:y+height})
+}
 fn state_kind(show:u32)->u8 { if show==3 {1} else if [2,6,7,11].contains(&show) {2} else {0} }
 fn interpolate(a:i32,b:i32,step:i64,total:i64)->i32 { (i64::from(a)+(i64::from(b)-i64::from(a))*step/total) as i32 }
+const ANIMATION_MS:u64=250;
+const ANIMATION_FRAMES:u64=16;
+fn eased_progress(elapsed:Duration)->i64 {
+    const SCALE:i64=10_000;
+    let t=(elapsed.as_micros().min(u128::from(ANIMATION_MS)*1000) as i64)*SCALE/(ANIMATION_MS as i64*1000);
+    t*t*(3*SCALE-2*t)/(SCALE*SCALE)
+}
+#[link(name="winmm")] unsafe extern "system" {fn timeBeginPeriod(ms:u32)->u32;fn timeEndPeriod(ms:u32)->u32;}
+struct TimerResolution(bool);
+impl TimerResolution {fn acquire()->Self{Self(unsafe{timeBeginPeriod(1)==0})}}
+impl Drop for TimerResolution {fn drop(&mut self){if self.0{unsafe{timeEndPeriod(1);}}}}
 #[derive(Debug,PartialEq,Eq)] enum PlacementAction { None, StateOnly, Geometry }
 fn placement_action(old:Rect,old_show:u32,new:Rect,new_show:u32)->PlacementAction {
     if old!=new {PlacementAction::Geometry} else if state_kind(old_show)!=state_kind(new_show) {PlacementAction::StateOnly} else {PlacementAction::None}
@@ -450,13 +539,51 @@ fn actual_window_is_untouched_then_moves_smoothly() {
         let window=crate::CreateWindowExW(0,name.as_ptr(),name.as_ptr(),0,40,40,200,100,null_mut(),null_mut(),instance,null_mut());assert!(!window.is_null());let hwnd=window as isize;
         let mut rect=Rect::default();assert_ne!(GetWindowRect(hwnd,(&mut rect as *mut Rect).cast()),0);
         let live=Live{hwnd,exe:String::new(),class:String::new(),title:String::new(),folder:None,monitor:0,rect,show:1,identity:None};
-        CHANGES.store(0,Ordering::SeqCst);place_window(hwnd,&live,rect,1).unwrap();assert_eq!(CHANGES.load(Ordering::SeqCst),0);
-        let goal=Rect{left:rect.left+20,right:rect.right+20,..rect};let start=std::time::Instant::now();place_window(hwnd,&live,goal,1).unwrap();
-        assert!(start.elapsed()>=Duration::from_millis(450));let mut actual=Rect::default();assert_ne!(GetWindowRect(hwnd,(&mut actual as *mut Rect).cast()),0);assert_eq!(actual,goal);assert!(CHANGES.load(Ordering::SeqCst)>1);
+        CHANGES.store(0,Ordering::SeqCst);place_window(hwnd,&live,rect,1,true).unwrap();assert_eq!(CHANGES.load(Ordering::SeqCst),0);
+        let goal=Rect{left:rect.left+20,right:rect.right+20,..rect};let start=std::time::Instant::now();place_window(hwnd,&live,goal,1,true).unwrap();
+        assert!(start.elapsed()>=Duration::from_millis(225));let mut actual=Rect::default();assert_ne!(GetWindowRect(hwnd,(&mut actual as *mut Rect).cast()),0);assert_eq!(actual,goal);assert!(CHANGES.load(Ordering::SeqCst)>1);
+        let moved=Live{rect:goal,..live};CHANGES.store(0,Ordering::SeqCst);
+        place_window(hwnd,&moved,rect,1,false).unwrap();assert_eq!(CHANGES.load(Ordering::SeqCst),1);
         crate::DestroyWindow(window);
     }
 }
-fn place_window(h:Hwnd, live:&Live, target:Rect, show:u32)->Result<(),String> {
+#[cfg(test)]
+#[test]
+fn existing_windows_animate_concurrently() {
+    use std::{ffi::c_void,ptr::{null,null_mut},sync::{mpsc,OnceLock,atomic::{AtomicIsize,AtomicU64,AtomicUsize,Ordering}}};
+    static START:OnceLock<std::time::Instant>=OnceLock::new();
+    static A:AtomicIsize=AtomicIsize::new(0);static B:AtomicIsize=AtomicIsize::new(0);
+    static FIRST_A:AtomicU64=AtomicU64::new(0);static FIRST_B:AtomicU64=AtomicU64::new(0);
+    static LAST_A:AtomicU64=AtomicU64::new(0);static LAST_B:AtomicU64=AtomicU64::new(0);
+    static CLOSED:AtomicUsize=AtomicUsize::new(0);
+    unsafe extern "system" fn proc(h:*mut c_void,msg:u32,w:usize,l:isize)->isize {
+        if msg==0x46 {let t=START.get().unwrap().elapsed().as_micros() as u64+1;
+            let pair=if h as isize==A.load(Ordering::SeqCst){Some((&FIRST_A,&LAST_A))}else if h as isize==B.load(Ordering::SeqCst){Some((&FIRST_B,&LAST_B))}else{None};
+            if let Some((first,last))=pair{let _=first.compare_exchange(0,t,Ordering::SeqCst,Ordering::SeqCst);last.store(t,Ordering::SeqCst);}}
+        if msg==2 && CLOSED.fetch_add(1,Ordering::SeqCst)+1==2{unsafe{crate::PostQuitMessage(0)}}
+        unsafe{crate::DefWindowProcW(h,msg,w,l)}
+    }
+    START.get_or_init(std::time::Instant::now);
+    let(tx,rx)=mpsc::channel();let ui=thread::spawn(move||unsafe{
+        let name=crate::wide("myDesktopParallelPlacementTest");let instance=crate::GetModuleHandleW(null());
+        let class=crate::WndClassW{style:0,wnd_proc:Some(proc),cls_extra:0,wnd_extra:0,instance,icon:null_mut(),cursor:null_mut(),background:null_mut(),menu_name:null(),class_name:name.as_ptr()};
+        assert_ne!(crate::RegisterClassW(&class),0);
+        let a=crate::CreateWindowExW(0,name.as_ptr(),name.as_ptr(),0,40,40,200,100,null_mut(),null_mut(),instance,null_mut());
+        let b=crate::CreateWindowExW(0,name.as_ptr(),name.as_ptr(),0,80,80,200,100,null_mut(),null_mut(),instance,null_mut());
+        assert!(!a.is_null()&&!b.is_null());A.store(a as isize,Ordering::SeqCst);B.store(b as isize,Ordering::SeqCst);tx.send((a as isize,b as isize)).unwrap();
+        let mut msg:crate::Msg=zeroed();while crate::GetMessageW(&mut msg,null_mut(),0,0)>0{crate::TranslateMessage(&msg);crate::DispatchMessageW(&msg);}
+    });
+    let(a,b)=rx.recv_timeout(Duration::from_secs(5)).unwrap();let mut work=Vec::new();
+    for hwnd in [a,b]{let mut r=Rect::default();unsafe{assert_ne!(GetWindowRect(hwnd,(&mut r as *mut Rect).cast()),0);}
+        let live=Live{hwnd,exe:String::new(),class:String::new(),title:"finestra test".into(),folder:None,monitor:0,rect:r,show:1,identity:None};
+        let saved=Window{exe:String::new(),class:String::new(),title:"finestra test".into(),folder:None,monitor_id:String::new(),monitor_device:String::new(),rect:r,show:1,identity:None};
+        let target=Rect{left:r.left+40,right:r.right+40,..r};queue_placement(&mut work,&saved,live,target,true).unwrap();}
+    for (_,handle) in work{handle.join().unwrap().unwrap();}
+    let(first_a,first_b,last_a,last_b)=(FIRST_A.load(Ordering::SeqCst),FIRST_B.load(Ordering::SeqCst),LAST_A.load(Ordering::SeqCst),LAST_B.load(Ordering::SeqCst));
+    unsafe{crate::PostMessageW(a as *mut c_void,0x10,0,0);crate::PostMessageW(b as *mut c_void,0x10,0,0);}ui.join().unwrap();
+    assert!(first_a>0&&first_b>0&&first_a<last_b&&first_b<last_a,"Le animazioni non si sono sovrapposte");
+}
+fn place_window(h:Hwnd, live:&Live, target:Rect, show:u32, animate:bool)->Result<(),String> {
     let old_state=state_kind(live.show); let new_state=state_kind(show);
     let action=placement_action(live.rect,live.show,target,show);
     if action==PlacementAction::None {return Ok(());}
@@ -467,24 +594,33 @@ fn place_window(h:Hwnd, live:&Live, target:Rect, show:u32)->Result<(),String> {
         if unsafe{GetWindowPlacement(h,(&mut p as *mut Placement).cast())}!=0 && state_kind(p.show)==new_state {return Ok(());}
         return crate::ipc::move_window(h,target.left,target.top,width,height,show);
     }
-    // Preserve normal windows' state and size whenever possible. Minimized or
-    // maximized windows must first be restored to change their normal rectangle.
+    // Use the visible rectangle as the start for a maximized window, then put
+    // its restored frame there before animating. Minimized windows are not visible.
+    let mut from=live.rect;
+    if animate && old_state==1 {let mut visible=Rect::default();if unsafe{GetWindowRect(h,(&mut visible as *mut Rect).cast())}!=0{from=visible;}}
     if old_state!=0 {unsafe{ShowWindow(h,9);}}
-    let size_same=live.rect.right-live.rect.left==width && live.rect.bottom-live.rect.top==height;
-    let smooth=old_state==0 && new_state==0;
-    let steps=if smooth {20} else {1};
+    if animate && old_state==1 {
+        let ok=unsafe{SetWindowPos(h,0,from.left,from.top,(from.right-from.left).max(1),(from.bottom-from.top).max(1),0x14)};
+        if ok==0 {let e=std::io::Error::last_os_error();return if e.raw_os_error()==Some(5){crate::ipc::move_window(h,target.left,target.top,width,height,show)}else{Err(e.to_string())};}
+    }
+    let size_same=from.right-from.left==width && from.bottom-from.top==height;
+    let smooth=animate && old_state!=2;
+    let _resolution=if smooth{Some(TimerResolution::acquire())}else{None};
+    let steps=if smooth {ANIMATION_FRAMES} else {1};
     let started=std::time::Instant::now();
     for step in 1..=steps {
-        if smooth {let due=Duration::from_millis(500*step as u64/steps as u64);if let Some(wait)=due.checked_sub(started.elapsed()){thread::sleep(wait);}}
-        let x=interpolate(live.rect.left,target.left,step,steps);
-        let y=interpolate(live.rect.top,target.top,step,steps);
-        let w=interpolate(live.rect.right-live.rect.left,width,step,steps);
-        let hgt=interpolate(live.rect.bottom-live.rect.top,height,step,steps);
+        if smooth {let due=Duration::from_micros(ANIMATION_MS*1000*step/steps);if let Some(wait)=due.checked_sub(started.elapsed()){thread::sleep(wait);}}
+        let progress=if smooth{eased_progress(started.elapsed())}else{10_000};
+        let x=interpolate(from.left,target.left,progress,10_000);
+        let y=interpolate(from.top,target.top,progress,10_000);
+        let w=interpolate(from.right-from.left,width,progress,10_000);
+        let hgt=interpolate(from.bottom-from.top,height,progress,10_000);
         let flags=0x14 | if size_same {1} else {0};
         if unsafe{SetWindowPos(h,0,x,y,w,hgt,flags)}==0 {
             let error=std::io::Error::last_os_error();
             return if error.raw_os_error()==Some(5) {crate::ipc::move_window(h,target.left,target.top,width,height,show)} else {Err(error.to_string())};
         }
+        if progress==10_000 {break}
     }
     if new_state!=0 {unsafe{ShowWindow(h,if new_state==1 {3}else{6});}}
     Ok(())
@@ -553,31 +689,108 @@ pub fn restore_mode(mode:RestoreMode)->Result<String,String>{restore_from_mode(&
 pub fn restore_from(path: &Path)->Result<String,String>{
     restore_from_mode(path,RestoreMode::Normal)
 }
+#[derive(Clone)] struct LaunchPlan {exe:String,folder:Option<String>,indices:Vec<usize>,rect:Rect}
+#[derive(Clone,Copy,PartialEq,Eq)] enum LaunchState {Waiting,Started,Failed}
+
+fn queue_placement(work:&mut Vec<(String,thread::JoinHandle<Result<(),String>>)>,s:&Window,live:Live,rect:Rect,animate:bool)->Result<(),String>{
+    let title=s.title.clone();let show=s.show;
+    let handle=thread::Builder::new().name("myDesktop-placement".into()).spawn(move||{
+        if window_status(&live)==WindowStatus::GoneOrReplaced{return Err("finestra non più disponibile".into())}
+        place_window(live.hwnd,&live,rect,show,animate)
+    }).map_err(|e|format!("Impossibile avviare il riposizionamento: {e}"))?;
+    work.push((title,handle));Ok(())
+}
+
+/// Build launch groups without starting duplicate generic processes. Explorer
+/// folders are independent requests and must each be opened separately.
+fn launch_plans(saved:&[Window],initial:&[Live],matched:&[Option<Hwnd>],mode:RestoreMode,monitors:&[Monitor])->(Vec<LaunchPlan>,Vec<bool>,usize,Vec<String>){
+    let mut plans:Vec<LaunchPlan>=Vec::new();let mut pending=vec![false;saved.len()];let mut skipped=0;let mut failed=Vec::new();
+    for (i,s) in saved.iter().enumerate(){
+        if matched[i].is_some(){continue}
+        if mode==RestoreMode::Soft {skipped+=1;continue}
+        if s.folder.is_none() && initial.iter().any(|w|equivalent(&s.exe,&w.exe)) {
+            failed.push(format!("{} (finestra non identificabile con certezza)",s.title));continue
+        }
+        let Some(rect)=destination(s,monitors) else{failed.push(format!("{} (monitor non disponibile)",s.title));continue};
+        pending[i]=true;
+        if s.folder.is_none(){
+            if let Some(plan)=plans.iter_mut().find(|p|p.folder.is_none()&&equivalent(&p.exe,&s.exe)){plan.indices.push(i);continue}
+        }
+        plans.push(LaunchPlan{exe:s.exe.clone(),folder:s.folder.clone(),indices:vec![i],rect});
+    }
+    (plans,pending,skipped,failed)
+}
 pub fn restore_from_mode(path:&Path,mode:RestoreMode)->Result<String,String>{
     let data=fs::read(path).map_err(|e|format!("Impossibile leggere la configurazione salvata: {e}"))?; let layout:Layout=serde_json::from_slice(&data).map_err(|e|format!("Configurazione non valida: {e}"))?; if layout.version!=1{return Err("Versione della configurazione non supportata.".into())} if layout.windows.is_empty(){return Err("La configurazione è vuota: nessuna finestra è stata modificata.".into())}
     let monitors=monitors(); if monitors.is_empty(){return Err("Nessun monitor disponibile.".into())}
-    let initial=windows()?;
+    // Folder discovery uses the shell and is only needed to identify saved
+    // Explorer locations; other restores can inspect windows immediately.
+    let initial=if layout.windows.iter().any(|w|w.folder.is_some()){windows()?}else{raw_windows()};
     let mut used=protect_unmatched_initial(&layout.windows,&initial);
-    let mut launched_windows=HashSet::new();
-    let mut succeeded=0; let mut skipped=0; let mut failed=Vec::new();let mut launched_exes=HashSet::new();
-    for (index,s) in layout.windows.iter().enumerate() {
-        let mut current=windows()?;
-        guard_live_windows(&initial,&mut current,&launched_windows,&mut used);
-        let mut found=plan_matches(&layout.windows[index..],&current,&used)[0];
-        if found.is_none(){
-            if mode==RestoreMode::Soft {skipped+=1;continue}
-            // A generic executable cannot identify which document or window to
-            // reopen. Explorer folders are an explicit exception: they have a
-            // saved path and can be opened independently.
-            if s.folder.is_none() && (current.iter().any(|w|equivalent(&s.exe,&w.exe)) || !launched_exes.insert(s.exe.to_lowercase())) {
-                failed.push(format!("{} (finestra non identificabile con certezza)",s.title));continue;
-            }
-            let before:HashSet<Hwnd>=current.iter().map(|w|w.hwnd).collect();
-            let launched=if let Some(folder)=&s.folder{crate::explorer::launch(folder).map_err(|e|e.to_string())}else{launch_application(&s.exe)};
-            match launched { Ok(())=>{for _ in 0..30{thread::sleep(Duration::from_millis(300));current=windows()?;for w in &current {if !before.contains(&w.hwnd)&&equivalent(&s.exe,&w.exe){launched_windows.insert(w.hwnd);}}guard_live_windows(&initial,&mut current,&launched_windows,&mut used);found=plan_matches(&layout.windows[index..],&current,&used)[0];if found.is_some(){break}}}, Err(error)=>{failed.push(format!("{} ({error})",s.title));continue;} }
+    let initial_handles:HashSet<_>=initial.iter().map(|w|w.hwnd).collect();
+    let matched=plan_matches(&layout.windows,&initial,&used);
+    let (plans,mut pending,skipped,mut failed)=launch_plans(&layout.windows,&initial,&matched,mode,&monitors);
+    let mut work=Vec::new();
+    for (i,found) in matched.iter().enumerate(){if let Some(h)=found{
+        used.insert(*h);let s=&layout.windows[i];
+        if let (Some(live),Some(rect))=(initial.iter().find(|w|w.hwnd==*h),destination(s,&monitors)){
+            if let Err(e)=queue_placement(&mut work,s,live.clone(),rect,true){failed.push(format!("{} ({e})",s.title));}
+        }else{failed.push(format!("{} (finestra o monitor non disponibile)",s.title));}
+    }}
+    let (tx,rx)=std::sync::mpsc::channel();let mut states=vec![LaunchState::Waiting;plans.len()];let mut attempted=HashSet::new();
+    for (group,plan) in plans.iter().cloned().enumerate(){
+        let sender=tx.clone();let exe=plan.exe.clone();
+        match thread::Builder::new().name("myDesktop-launch".into()).spawn(move||{
+            let result=std::panic::catch_unwind(||if let Some(folder)=&plan.folder {crate::explorer::launch(folder).map_err(|e|e.to_string())}else{launch_application(&plan.exe,plan.rect)})
+                .unwrap_or_else(|_|Err("Avvio dell'applicazione interrotto".into()));
+            let _=sender.send((group,result));
+        }){
+            Ok(_)=>{attempted.insert(exe.to_lowercase());},
+            Err(e)=>{states[group]=LaunchState::Failed;for &i in &plans[group].indices{pending[i]=false;failed.push(format!("{} (impossibile avviare: {e})",layout.windows[i].title));}}
         }
-        if let Some(h)=found { used.insert(h); let m=target(s,&monitors).unwrap(); let r=s.rect; let mut x=m.rect.left+r.left; let mut y=m.rect.top+r.top; let mut width=(r.right-r.left).max(1); let mut height=(r.bottom-r.top).max(1); let same=if s.monitor_id.is_empty(){m.device.eq_ignore_ascii_case(&s.monitor_device)}else{m.id.eq_ignore_ascii_case(&s.monitor_id)}; if !same {width=width.min(m.work.right-m.work.left);height=height.min(m.work.bottom-m.work.top);x=x.clamp(m.work.left,m.work.right-width);y=y.clamp(m.work.top,m.work.bottom-height);} let desired=Rect{left:x,top:y,right:x+width,bottom:y+height}; if let Some(live)=current.iter().find(|w|w.hwnd==h) {match place_window(h,live,desired,s.show){Ok(())=>succeeded+=1,Err(error)=>failed.push(format!("{} ({error})",s.title))}} else {failed.push(s.title.clone())} } else {failed.push(s.title.clone())}
     }
+    drop(tx);
+    let mut launched=HashSet::new();let mut folders=std::collections::HashMap::new();
+    let mut folder_rx:Option<std::sync::mpsc::Receiver<Result<std::collections::HashMap<isize,String>,String>>>=None;
+    let mut folder_error:Option<String>=None;let deadline=std::time::Instant::now()+Duration::from_secs(30);
+    while pending.iter().any(|&p|p) && std::time::Instant::now()<deadline {
+        while let Ok((group,result))=rx.try_recv(){match result{
+            Ok(())=>states[group]=LaunchState::Started,
+            Err(e)=>{states[group]=LaunchState::Failed;for &i in &plans[group].indices{if pending[i]{pending[i]=false;failed.push(format!("{} ({e})",layout.windows[i].title));}}}
+        }}
+        let active:Vec<usize>=plans.iter().enumerate().filter(|(g,_)|states[*g]==LaunchState::Started)
+            .flat_map(|(_,p)|p.indices.iter().copied()).filter(|&i|pending[i]).collect();
+        if active.iter().any(|&i|layout.windows[i].folder.is_some()) && folder_rx.is_none(){
+            let (folder_tx,receiver)=std::sync::mpsc::channel();
+            if thread::Builder::new().name("myDesktop-folders".into()).spawn(move||{let _=folder_tx.send(crate::explorer::capture());}).is_ok(){folder_rx=Some(receiver);}
+        }
+        if let Some(receiver)=&folder_rx {match receiver.try_recv(){
+            Ok(Ok(found))=>{folders=found;folder_rx=None;folder_error=None;},
+            Ok(Err(e))=>{folder_error=Some(e);folder_rx=None;},
+            Err(std::sync::mpsc::TryRecvError::Disconnected)=>{folder_error=Some("Lettura cartelle di Esplora file interrotta".into());folder_rx=None;},
+            Err(std::sync::mpsc::TryRecvError::Empty)=>()
+        }}
+        if !active.is_empty(){
+            let original=raw_windows();let mut current=original.clone();
+            for w in &mut current {w.folder=folders.get(&w.hwnd).cloned();if !initial_handles.contains(&w.hwnd)&&attempted.contains(&w.exe.to_lowercase()){launched.insert(w.hwnd);}}
+            guard_live_windows(&initial,&mut current,&launched,&mut used);
+            let candidates:Vec<_>=active.iter().map(|&i|layout.windows[i].clone()).collect();
+            let assignments=plan_matches(&candidates,&current,&used);
+            for (&i,found) in active.iter().zip(assignments){if let Some(h)=found{
+                pending[i]=false;used.insert(h);let s=&layout.windows[i];
+                if let (Some(live),Some(rect))=(original.iter().find(|w|w.hwnd==h),destination(s,&monitors)){
+                    if let Err(e)=queue_placement(&mut work,s,live.clone(),rect,false){failed.push(format!("{} ({e})",s.title));}
+                }else{failed.push(format!("{} (finestra o monitor non disponibile)",s.title));}
+            }}
+        }
+        if pending.iter().any(|&p|p){thread::sleep(Duration::from_millis(50));}
+    }
+    for (i,&waiting) in pending.iter().enumerate(){if waiting{
+        let detail=if layout.windows[i].folder.is_some(){folder_error.as_deref().unwrap_or("finestra non identificabile entro il tempo previsto")}else{"finestra non identificabile entro il tempo previsto"};
+        failed.push(format!("{} ({detail})",layout.windows[i].title));
+    }}
+    let mut succeeded=0;
+    for (title,handle) in work {match handle.join(){Ok(Ok(()))=>succeeded+=1,Ok(Err(e))=>failed.push(format!("{title} ({e})")),Err(_)=>failed.push(format!("{title} (riposizionamento interrotto)"))}}
     if mode==RestoreMode::Hard {
         if failed.is_empty() {failed.extend(close_extra_apps(mode,&layout.windows,&initial));}
         else {failed.push("Nessuna app aggiuntiva è stata chiusa perché il ripristino è incompleto".into());}
