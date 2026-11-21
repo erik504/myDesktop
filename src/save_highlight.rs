@@ -2,14 +2,59 @@
 use std::{
     cell::RefCell,
     ffi::c_void,
+    fs,
+    io::ErrorKind,
     ptr::{null, null_mut},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
     time::{Duration, Instant},
 };
 type Handle = *mut c_void;
 pub const SHOW: u32 = crate::WM_APP + 4;
 pub const TIMER: usize = 0x4d49;
 const FLASH_DURATION: Duration = Duration::from_millis(100);
+static ENABLED: AtomicBool = AtomicBool::new(false);
+
+pub fn enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn load_preference() -> Result<(), String> {
+    let path = crate::core::profile_dir()?.join("show-save-highlight");
+    let enabled = match fs::metadata(path) {
+        Ok(metadata) => metadata.is_file(),
+        Err(e) if e.kind() == ErrorKind::NotFound => false,
+        Err(e) => return Err(format!("Impossibile leggere «Mostra salvataggio» ({e}).")),
+    };
+    ENABLED.store(enabled, Ordering::Relaxed);
+    Ok(())
+}
+
+pub fn toggle_preference() -> Result<(), String> {
+    let enabled = !enabled();
+    let directory = crate::core::profile_dir()?;
+    let path = directory.join("show-save-highlight");
+    let result = if enabled {
+        fs::create_dir_all(&directory).and_then(|()| {
+            fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .map(drop)
+        })
+    } else {
+        match fs::remove_file(&path) {
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            result => result,
+        }
+    };
+    result.map_err(|e| format!("Impossibile aggiornare «Mostra salvataggio» ({e})."))?;
+    ENABLED.store(enabled, Ordering::Relaxed);
+    Ok(())
+}
 const YELLOW: u32 = 0x0000ffff; // Win32 COLORREF: red + green.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]

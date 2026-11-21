@@ -43,6 +43,7 @@ const NIF_TIP: u32 = 4;
 const MF_STRING: u32 = 0;
 const MF_SEPARATOR: u32 = 0x800;
 const MF_CHECKED: u32 = 0x8;
+const TOGGLE_SAVE_HIGHLIGHT: u32 = 11;
 const TPM_RIGHTBUTTON: u32 = 2;
 const TPM_RETURNCMD: u32 = 0x100;
 const ERROR_ALREADY_EXISTS: u32 = 183;
@@ -128,8 +129,9 @@ fn start_job(hwnd: Handle, save: bool, path: Option<std::path::PathBuf>, mode:co
     if BUSY.swap(true, Ordering::AcqRel) { tell("Un'operazione è già in corso. Attendi il completamento.", true); return; }
     unsafe { success::stop(hwnd); spinner::start(hwnd); }
     let target = hwnd as usize;
+    let highlight_owner = save_highlight::enabled().then_some(target as isize);
     let started = std::thread::Builder::new().spawn(move || {
-        let outcome = std::panic::catch_unwind(|| match (save, path.as_deref(),mode) { (true, Some(path),_) => core::save_to(path), (true, None,_) => core::save(target as isize), (false, Some(path),core::RestoreMode::Normal) => core::restore_from(path), (false,None,core::RestoreMode::Normal)=>core::restore(), (false,Some(path),mode)=>core::restore_from_mode(path,mode), (false,None,mode)=>core::restore_mode(mode) });
+        let outcome = std::panic::catch_unwind(|| match (save, path.as_deref(),mode) { (true, Some(path),_) => core::save_to(path), (true, None,_) => core::save(highlight_owner), (false, Some(path),core::RestoreMode::Normal) => core::restore_from(path), (false,None,core::RestoreMode::Normal)=>core::restore(), (false,Some(path),mode)=>core::restore_from_mode(path,mode), (false,None,mode)=>core::restore_mode(mode) });
         let result = JobCompletion::Standard(match outcome { Ok(result) => result, Err(_) => Err("Errore inatteso durante l'operazione.".into()) });
         *JOB_RESULT.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
         if unsafe { PostMessageW(target as Handle, JOB_FINISHED, 0, 0) } == 0 {
@@ -211,6 +213,8 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
                 AppendMenuW(menu, MF_STRING, 9, wide("Ripristina finestre (chiudi estranee)").as_ptr());
                 AppendMenuW(menu, MF_STRING, 6, wide("Memorizza finestre come...").as_ptr());
                 AppendMenuW(menu, MF_STRING, 7, wide("Ripristina finestre da...").as_ptr());
+                let highlight_flags = if save_highlight::enabled() { MF_CHECKED } else { MF_STRING };
+                AppendMenuW(menu, highlight_flags, TOGGLE_SAVE_HIGHLIGHT as usize, wide("Mostra salvataggio").as_ptr());
                 let service_status=service::is_installed();
                 let startup_status = startup::enabled();
                 let incomplete=matches!((&startup_status,&service_status),(Ok(a),Ok(b)) if a!=b);
@@ -226,6 +230,11 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
                 match command {
                     1 => start_job(hwnd, true, None,core::RestoreMode::Normal),
                     10 => begin_single_selection(hwnd),
+                    TOGGLE_SAVE_HIGHLIGHT => {
+                        if let Err(error) = save_highlight::toggle_preference() {
+                            tell(&error, true);
+                        }
+                    }
                     2 => start_job(hwnd, false, None,core::RestoreMode::Normal),
                     8 => start_job(hwnd, false, None,core::RestoreMode::Soft),
                     9 => {
@@ -326,6 +335,7 @@ fn main() {
     if hwnd.is_null() { tell("Impossibile avviare myDesktop.", true); CloseHandle(mutex); return; }
     TRAY_WINDOW.store(hwnd as isize,Ordering::Release);
     if Shell_NotifyIconW(NIM_ADD, &mut tray_data(hwnd)) == 0 { tell("Impossibile mostrare l'icona nell'area di notifica.", true); DestroyWindow(hwnd); CloseHandle(mutex); return; }
+    if let Err(error) = save_highlight::load_preference() { tell(&error, true); }
     let mut msg: Msg = std::mem::zeroed();
     while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 { TranslateMessage(&msg); DispatchMessageW(&msg); }
     CloseHandle(mutex);

@@ -42,7 +42,11 @@ struct Rect { left: i32, top: i32, right: i32, bottom: i32 }
 #[link(name="shell32")] unsafe extern "system" { fn ShellExecuteW(hwnd: Hwnd, operation: *const u16, file: *const u16, parameters: *const u16, directory: *const u16, show: i32) -> isize; }
 
 fn text(buf: &[u16]) -> String { String::from_utf16_lossy(&buf[..buf.iter().position(|&c| c == 0).unwrap_or(buf.len())]) }
-fn db_path() -> Result<PathBuf,String> { let p=std::env::var_os("APPDATA").ok_or("Cartella APPDATA non disponibile")?; Ok(PathBuf::from(p).join("myDesktop").join("layout.json")) }
+pub(crate) fn profile_dir() -> Result<PathBuf,String> {
+    let appdata=std::env::var_os("APPDATA").ok_or("Cartella APPDATA non disponibile")?;
+    Ok(PathBuf::from(appdata).join("myDesktop"))
+}
+fn db_path() -> Result<PathBuf,String> { Ok(profile_dir()?.join("layout.json")) }
 
 #[derive(Clone, Serialize, Deserialize)] struct Monitor { id: String, device: String, rect: Rect, work: Rect, primary: bool }
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)] struct WindowIdentity { hwnd:u64, pid:u32, created:u64 }
@@ -166,8 +170,8 @@ fn write_single_update(path:&Path,open:&[Live],selected:&Live,saved:Window)->Res
     Ok(())
 }
 
-pub fn save(owner:isize)->Result<String,String>{
-    save_impl(&db_path()?,Some(owner))
+pub fn save(highlight_owner:Option<isize>)->Result<String,String>{
+    save_impl(&db_path()?,highlight_owner)
 }
 pub fn save_to(path: &Path)->Result<String,String>{
     save_impl(path,None)
