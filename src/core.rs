@@ -61,29 +61,43 @@ unsafe fn monitor_data(h: isize) -> Option<Monitor> { unsafe {
 unsafe extern "system" fn monitor_cb(h:isize,_:isize,_:*mut Rect,arg:isize)->i32 { unsafe { if let Some(m)=monitor_data(h) { (*(arg as *mut Vec<Monitor>)).push(m); } } 1 }
 fn monitors()->Vec<Monitor>{ let mut m=Vec::new(); unsafe { EnumDisplayMonitors(0,std::ptr::null(),Some(monitor_cb),&mut m as *mut _ as isize); } m }
 unsafe fn process_path(pid:u32)->Option<String>{ unsafe { let p=OpenProcess(0x1000,0,pid); if p.is_null(){return None} let mut b=vec![0u16;32768]; let mut n=b.len() as u32; let ok=QueryFullProcessImageNameW(p,0,b.as_mut_ptr(),&mut n); CloseHandle(p); if ok==0 {None} else {Some(String::from_utf16_lossy(&b[..n as usize]))} } }
-unsafe extern "system" fn window_cb(h:Hwnd,arg:isize)->i32 { unsafe {
-    if IsWindowVisible(h)==0 || GetWindow(h,4)!=0 || GetWindowLongW(h,-20)&0x80!=0 { return 1; }
-    let mut cloaked=0u32; if DwmGetWindowAttribute(h,14,&mut cloaked,4)==0 && cloaked!=0 {return 1}
-    let mut pid=0; GetWindowThreadProcessId(h,&mut pid); if pid==std::process::id(){return 1}
-    let Some(exe)=process_path(pid) else{return 1};
+unsafe fn read_window(h:Hwnd)->Option<Live> { unsafe {
+    if IsWindowVisible(h)==0 || GetWindow(h,4)!=0 || GetWindowLongW(h,-20)&0x80!=0 { return None; }
+    let mut cloaked=0u32; if DwmGetWindowAttribute(h,14,&mut cloaked,4)==0 && cloaked!=0 {return None}
+    let mut pid=0; GetWindowThreadProcessId(h,&mut pid); if pid==std::process::id(){return None}
+    let exe=process_path(pid)?;
     let mut cls=[0u16;256]; GetClassNameW(h,cls.as_mut_ptr(),cls.len() as i32); let class=text(&cls);
-    if ["Progman","WorkerW","Shell_TrayWnd","Windows.UI.Core.CoreWindow"].contains(&class.as_str()) {return 1}
+    if ["Progman","WorkerW","Shell_TrayWnd","Windows.UI.Core.CoreWindow"].contains(&class.as_str()) {return None}
     let len=GetWindowTextLengthW(h).clamp(0,32767); let mut tb=vec![0u16;len as usize+1]; GetWindowTextW(h,tb.as_mut_ptr(),tb.len() as i32); let title=text(&tb);
-    if title.is_empty() {return 1}
-    let mut wp:Placement=zeroed(); wp.length=size_of::<Placement>() as u32; if GetWindowPlacement(h,(&mut wp as *mut Placement).cast())==0{return 1}
-    let monitor=MonitorFromWindow(h,2); let Some(mi)=monitor_data(monitor) else{return 1};
+    if title.is_empty() {return None}
+    let mut wp:Placement=zeroed(); wp.length=size_of::<Placement>() as u32; if GetWindowPlacement(h,(&mut wp as *mut Placement).cast())==0{return None}
+    let monitor=MonitorFromWindow(h,2); let mi=monitor_data(monitor)?;
     let mut r=Rect::default(); if wp.show==1 { GetWindowRect(h,(&mut r as *mut Rect).cast()); } else { r=wp.normal; let dx=mi.work.left-mi.rect.left; let dy=mi.work.top-mi.rect.top; r.left+=dx;r.right+=dx;r.top+=dy;r.bottom+=dy; }
     let identity=crate::ipc::process_created(pid).map(|created|WindowIdentity{hwnd:h as u64,pid,created});
-    (*(arg as *mut Vec<Live>)).push(Live{ hwnd:h,exe,class,title,folder:None,monitor,rect:r,show:wp.show,identity }); 1
+    Some(Live{ hwnd:h,exe,class,title,folder:None,monitor,rect:r,show:wp.show,identity })
 } }
-fn raw_windows()->Vec<Live>{let mut v:Vec<Live>=Vec::new();unsafe{EnumWindows(Some(window_cb),&mut v as *mut _ as isize);}v}
-fn windows()->Result<Vec<Live>,String>{ let mut v=raw_windows(); if v.iter().any(|w|w.class=="CabinetWClass"){let folders=crate::explorer::capture()?;for w in &mut v {w.folder=folders.get(&w.hwnd).cloned();if w.class=="CabinetWClass" && w.folder.is_none(){return Err(format!("Impossibile leggere la cartella di Esplora file: {}",w.title));}}} Ok(v) }
+fn scan_windows(highlight_owner:Option<isize>)->Vec<Live> {
+    struct Scan { windows:Vec<Live>, highlight_owner:Option<isize> }
+    unsafe extern "system" fn window_cb(hwnd:Hwnd,arg:isize)->i32 {unsafe{
+        if let Some(window)=read_window(hwnd) {
+            let scan=&mut *(arg as *mut Scan);
+            scan.windows.push(window);
+            if let Some(owner)=scan.highlight_owner {
+                crate::save_highlight::enqueue(owner,hwnd);
+            }
+        }
+        1
+    }}
+    let mut scan=Scan{windows:Vec::new(),highlight_owner};
+    unsafe {EnumWindows(Some(window_cb),&mut scan as *mut Scan as isize);}
+    scan.windows
+}
+fn raw_windows()->Vec<Live>{scan_windows(None)}
+fn windows(highlight_owner:Option<isize>)->Result<Vec<Live>,String>{ let mut v=scan_windows(highlight_owner); if v.iter().any(|w|w.class=="CabinetWClass"){let folders=crate::explorer::capture()?;for w in &mut v {w.folder=folders.get(&w.hwnd).cloned();if w.class=="CabinetWClass" && w.folder.is_none(){return Err(format!("Impossibile leggere la cartella di Esplora file: {}",w.title));}}} Ok(v) }
 
 /// The picker uses the same eligibility rules as the normal save operation.
 pub fn selectable(hwnd:isize)->bool {
-    let mut found:Vec<Live>=Vec::new();
-    unsafe {window_cb(hwnd,&mut found as *mut _ as isize);}
-    !found.is_empty()
+    unsafe {read_window(hwnd).is_some()}
 }
 
 fn saved_window(w:&Live)->Result<Window,String>{
@@ -123,7 +137,7 @@ pub fn selection_token(hwnd:isize)->Result<(u32,Option<u64>),String>{
 }
 pub fn save_one(hwnd:isize,token:(u32,Option<u64>))->Result<String,String>{save_one_to(hwnd,token,&db_path()?)}
 fn save_one_to(hwnd:isize,token:(u32,Option<u64>),path:&Path)->Result<String,String>{
-    let mut open:Vec<Live>=Vec::new();unsafe{EnumWindows(Some(window_cb),&mut open as *mut _ as isize);}
+    let mut open=raw_windows();
     let selected_index=open.iter().position(|w|w.hwnd==hwnd).ok_or("La finestra selezionata non è più disponibile o non è gestibile.")?;
     let mut pid=0;unsafe{GetWindowThreadProcessId(hwnd,&mut pid);}
     if pid!=token.0 || token.1.is_some_and(|created|open[selected_index].identity.as_ref().map(|i|i.created)!=Some(created)) {
@@ -152,25 +166,16 @@ fn write_single_update(path:&Path,open:&[Live],selected:&Live,saved:Window)->Res
     Ok(())
 }
 
-pub fn save()->Result<String,String>{
-    save_impl(&db_path()?,true)
+pub fn save(owner:isize)->Result<String,String>{
+    save_impl(&db_path()?,Some(owner))
 }
 pub fn save_to(path: &Path)->Result<String,String>{
-    save_impl(path,false)
+    save_impl(path,None)
 }
-fn save_impl(path:&Path,highlight:bool)->Result<String,String>{
-    // Capture the whole layout first, so the visual feedback does not make
-    // later windows reflect changes made during the 200 ms per-window display.
-    save_captured(path,windows()?,highlight)
-}
-fn save_captured(path:&Path,captured:Vec<Live>,highlight:bool)->Result<String,String>{
-    let mut out=Vec::new();let mut highlighted=Vec::new();
-    for w in captured{ if let Some(m)=unsafe{monitor_data(w.monitor)} {highlighted.push((w.hwnd,w.identity.clone()));out.push(Window{exe:w.exe,class:w.class,title:w.title,folder:w.folder,monitor_id:m.id,monitor_device:m.device,rect:Rect{left:w.rect.left-m.rect.left,top:w.rect.top-m.rect.top,right:w.rect.right-m.rect.left,bottom:w.rect.bottom-m.rect.top},show:w.show,identity:w.identity});} }
+fn save_impl(path:&Path,highlight_owner:Option<isize>)->Result<String,String>{
+    let mut out=Vec::new();
+    for w in windows(highlight_owner)? {if let Ok(saved)=saved_window(&w){out.push(saved);}}
     if out.is_empty(){return Err("Nessuna finestra gestibile trovata: configurazione precedente conservata.".into())}
-    if highlight {let overlay=crate::save_highlight::Overlay::new()?;for (hwnd,identity) in highlighted{
-        if let Some(identity)=identity {let mut pid=0;if unsafe{GetWindowThreadProcessId(hwnd,&mut pid)}==0 || pid!=identity.pid || crate::ipc::process_created(pid)!=Some(identity.created){continue}}
-        overlay.flash(hwnd)?;
-    }}
     fs::create_dir_all(path.parent().ok_or("Cartella del file non valida")?).map_err(|e|e.to_string())?;
     let data=serde_json::to_vec_pretty(&Layout{version:1,windows:out}).map_err(|e|e.to_string())?;
     write_layout(path, &data)?;
@@ -409,7 +414,7 @@ fn write_layout(path: &Path, data: &[u8]) -> Result<(), String> {
     }
     #[test] #[ignore = "read-only check against currently open Chrome windows"]
     fn real_chrome_windows_keep_their_identity_when_order_and_title_change(){
-        let mut observed:Vec<Live>=Vec::new();unsafe{EnumWindows(Some(window_cb),&mut observed as *mut _ as isize);}
+        let observed=raw_windows();
         let mut chrome:Vec<Live>=observed.into_iter().filter(|w|is_chrome(&w.exe)&&w.identity.is_some()).collect();
         assert!(chrome.len()>=2,"Servono almeno due finestre Chrome identificabili");
         let saved:Vec<Window>=chrome.iter().map(|w|Window{exe:w.exe.clone(),class:w.class.clone(),title:w.title.clone(),folder:None,monitor_id:String::new(),monitor_device:String::new(),rect:w.rect,show:w.show,identity:w.identity.clone()}).collect();
@@ -419,31 +424,6 @@ fn write_layout(path: &Path, data: &[u8]) -> Result<(), String> {
         assert_eq!(actual,expected);
     }
     #[test] fn named_layout_writes_selected_file_and_preserves_other_file(){let dir=std::env::temp_dir().join(format!("mydesktop-layout-test-{}-{:?}",std::process::id(),std::thread::current().id()));fs::create_dir(&dir).unwrap();let a=dir.join("first.json");let b=dir.join("second.json");write_layout(&a,b"first").unwrap();write_layout(&b,b"second").unwrap();write_layout(&a,b"updated").unwrap();assert_eq!(fs::read(&a).unwrap(),b"updated");assert_eq!(fs::read(&b).unwrap(),b"second");fs::remove_file(a).unwrap();fs::remove_file(b).unwrap();fs::remove_dir(dir).unwrap();}
-    #[test] #[ignore] fn highlighted_save_keeps_snapshot_and_does_not_move_window(){unsafe{
-        use std::{ffi::c_void,ptr::{null,null_mut},sync::atomic::{AtomicUsize,Ordering}};
-        #[link(name="kernel32")] unsafe extern "system" {fn SetErrorMode(mode:u32)->u32;}
-        static CHANGES:AtomicUsize=AtomicUsize::new(0);
-        unsafe extern "system" fn proc(h:*mut c_void,msg:u32,w:usize,l:isize)->isize{
-            if msg==0x46{CHANGES.fetch_add(1,Ordering::SeqCst);}unsafe{crate::DefWindowProcW(h,msg,w,l)}
-        }
-        struct Cleanup{hwnd:*mut c_void,dir:PathBuf}
-        impl Drop for Cleanup{fn drop(&mut self){unsafe{crate::DestroyWindow(self.hwnd);}
-            let _=fs::remove_file(self.dir.join("default.json"));let _=fs::remove_file(self.dir.join("named.json"));let _=fs::remove_dir(&self.dir);}}
-        SetErrorMode(2);let dir=std::env::temp_dir().join(format!("mydesktop-highlight-save-test-{}",std::process::id()));fs::create_dir(&dir).unwrap();
-        let name=crate::wide("myDesktopHighlightSaveTest");let instance=crate::GetModuleHandleW(null());
-        let class=crate::WndClassW{style:0,wnd_proc:Some(proc),cls_extra:0,wnd_extra:0,instance,icon:null_mut(),cursor:null_mut(),background:null_mut(),menu_name:null(),class_name:name.as_ptr()};assert_ne!(crate::RegisterClassW(&class),0);
-        let hwnd=crate::CreateWindowExW(0x08000080,name.as_ptr(),name.as_ptr(),0x80000000,60,60,220,140,null_mut(),null_mut(),instance,null_mut());
-        let cleanup=Cleanup{hwnd,dir:dir.clone()};assert!(!cleanup.hwnd.is_null());
-        assert_ne!(SetWindowPos(hwnd as isize,-1,60,60,220,140,0x10|0x40),0);
-        let mut r=Rect::default();assert_ne!(GetWindowRect(hwnd as isize,(&mut r as *mut Rect).cast()),0);let monitor=MonitorFromWindow(hwnd as isize,2);
-        let pid=std::process::id();let identity=WindowIdentity{hwnd:hwnd as u64,pid,created:crate::ipc::process_created(pid).unwrap()};
-        let live=Live{hwnd:hwnd as isize,exe:"test.exe".into(),class:"Test".into(),title:"Test".into(),folder:None,monitor,rect:r,show:1,identity:Some(identity)};
-        CHANGES.store(0,Ordering::SeqCst);let started=std::time::Instant::now();
-        save_captured(&dir.join("default.json"),vec![live.clone()],true).unwrap();assert!(started.elapsed()>=Duration::from_millis(200));
-        let mut after=Rect::default();assert_ne!(GetWindowRect(hwnd as isize,(&mut after as *mut Rect).cast()),0);assert_eq!(r,after);assert_eq!(CHANGES.load(Ordering::SeqCst),0);
-        save_captured(&dir.join("named.json"),vec![live],false).unwrap();assert_eq!(fs::read(dir.join("default.json")).unwrap(),fs::read(dir.join("named.json")).unwrap());
-        drop(cleanup);
-    }}
 }
 fn equivalent(a:&str,b:&str)->bool{a.eq_ignore_ascii_case(b)}
 fn mfc_style(class:&str)->Option<&str>{ let mut fields=class.split(':'); if fields.next()? != "Afx" {return None} let instance=fields.next()?; let style=fields.next()?; let cursor=fields.next()?; let background=fields.next()?; let icon=fields.next()?; if fields.next().is_some() || [instance,style,cursor,background,icon].iter().any(|s|s.is_empty() || !s.bytes().all(|c|c.is_ascii_hexdigit())) {return None} Some(style) }
@@ -763,7 +743,7 @@ pub fn restore_from_mode(path:&Path,mode:RestoreMode)->Result<String,String>{
     let monitors=monitors(); if monitors.is_empty(){return Err("Nessun monitor disponibile.".into())}
     // Folder discovery uses the shell and is only needed to identify saved
     // Explorer locations; other restores can inspect windows immediately.
-    let initial=if layout.windows.iter().any(|w|w.folder.is_some()){windows()?}else{raw_windows()};
+    let initial=if layout.windows.iter().any(|w|w.folder.is_some()){windows(None)?}else{raw_windows()};
     let mut used=protect_unmatched_initial(&layout.windows,&initial);
     let initial_handles:HashSet<_>=initial.iter().map(|w|w.hwnd).collect();
     let matched=plan_matches(&layout.windows,&initial,&used);

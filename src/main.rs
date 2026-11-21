@@ -129,7 +129,7 @@ fn start_job(hwnd: Handle, save: bool, path: Option<std::path::PathBuf>, mode:co
     unsafe { success::stop(hwnd); spinner::start(hwnd); }
     let target = hwnd as usize;
     let started = std::thread::Builder::new().spawn(move || {
-        let outcome = std::panic::catch_unwind(|| match (save, path.as_deref(),mode) { (true, Some(path),_) => core::save_to(path), (true, None,_) => core::save(), (false, Some(path),core::RestoreMode::Normal) => core::restore_from(path), (false,None,core::RestoreMode::Normal)=>core::restore(), (false,Some(path),mode)=>core::restore_from_mode(path,mode), (false,None,mode)=>core::restore_mode(mode) });
+        let outcome = std::panic::catch_unwind(|| match (save, path.as_deref(),mode) { (true, Some(path),_) => core::save_to(path), (true, None,_) => core::save(target as isize), (false, Some(path),core::RestoreMode::Normal) => core::restore_from(path), (false,None,core::RestoreMode::Normal)=>core::restore(), (false,Some(path),mode)=>core::restore_from_mode(path,mode), (false,None,mode)=>core::restore_mode(mode) });
         let result = JobCompletion::Standard(match outcome { Ok(result) => result, Err(_) => Err("Errore inatteso durante l'operazione.".into()) });
         *JOB_RESULT.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
         if unsafe { PostMessageW(target as Handle, JOB_FINISHED, 0, 0) } == 0 {
@@ -263,6 +263,8 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
         WM_EXITMENULOOP => {menu_help::hide(hwnd);0}
         WM_TIMER if w == menu_help::TIMER => {menu_help::show(hwnd);0}
         WM_TIMER if w == picker::TIMER => {picker::tick(hwnd);0}
+        save_highlight::SHOW => {save_highlight::show_pending(hwnd);0}
+        WM_TIMER if w == save_highlight::TIMER => {save_highlight::tick(hwnd);0}
         WM_TIMER if w == spinner::TIMER_ID => {
             if BUSY.load(Ordering::Acquire) { spinner::tick(hwnd); } else { spinner::stop(hwnd); if error_indicator::active(){error_indicator::draw(hwnd);} }
             0
@@ -294,7 +296,7 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
             }
             0
         }
-        WM_DESTROY => { picker::stop(hwnd); menu_help::destroy(hwnd); success::stop(hwnd); spinner::stop(hwnd); Shell_NotifyIconW(NIM_DELETE, &mut tray_data(hwnd)); PostQuitMessage(0); 0 }
+        WM_DESTROY => { save_highlight::destroy(hwnd); picker::stop(hwnd); menu_help::destroy(hwnd); success::stop(hwnd); spinner::stop(hwnd); Shell_NotifyIconW(NIM_DELETE, &mut tray_data(hwnd)); PostQuitMessage(0); 0 }
         _ => DefWindowProcW(hwnd, msg, w, l),
     }
 }
