@@ -7,6 +7,7 @@ mod explorer;
 mod ipc;
 mod menu_help;
 mod picker;
+mod save_highlight;
 mod protected;
 mod spinner;
 mod startup;

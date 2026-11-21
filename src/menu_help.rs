@@ -54,7 +54,7 @@ static COMMAND: AtomicU32 = AtomicU32::new(0);
     fn DeleteObject(object:Handle)->i32;
 }
 fn help(id:u32)->Option<&'static str> { Some(match id {
-    1=>"Salva posizione, stato e monitor delle finestre aperte, sostituendo la configurazione predefinita precedente.",
+    1=>"Salva posizione, stato e monitor delle finestre aperte, evidenziandole in giallo e sostituendo la configurazione predefinita precedente.",
     10=>"Evidenzia una finestra passando col mouse: fai clic per salvarla nella configurazione predefinita, oppure premi Esc per annullare.",
     2=>"Ripristina la configurazione predefinita e prova a riaprire le finestre mancanti. Le app aggiuntive restano aperte.",
     8=>"Ripristina solo le finestre già aperte presenti nel salvataggio. Non avvia app e lascia intatte quelle aggiuntive.",

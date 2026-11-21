@@ -153,11 +153,24 @@ fn write_single_update(path:&Path,open:&[Live],selected:&Live,saved:Window)->Res
 }
 
 pub fn save()->Result<String,String>{
-    save_to(&db_path()?)
+    save_impl(&db_path()?,true)
 }
 pub fn save_to(path: &Path)->Result<String,String>{
-    let mut out=Vec::new(); for w in windows()?{ if let Some(m)=unsafe{monitor_data(w.monitor)} {out.push(Window{exe:w.exe,class:w.class,title:w.title,folder:w.folder,monitor_id:m.id,monitor_device:m.device,rect:Rect{left:w.rect.left-m.rect.left,top:w.rect.top-m.rect.top,right:w.rect.right-m.rect.left,bottom:w.rect.bottom-m.rect.top},show:w.show,identity:w.identity});} }
+    save_impl(path,false)
+}
+fn save_impl(path:&Path,highlight:bool)->Result<String,String>{
+    // Capture the whole layout first, so the visual feedback does not make
+    // later windows reflect changes made during the 200 ms per-window display.
+    save_captured(path,windows()?,highlight)
+}
+fn save_captured(path:&Path,captured:Vec<Live>,highlight:bool)->Result<String,String>{
+    let mut out=Vec::new();let mut highlighted=Vec::new();
+    for w in captured{ if let Some(m)=unsafe{monitor_data(w.monitor)} {highlighted.push((w.hwnd,w.identity.clone()));out.push(Window{exe:w.exe,class:w.class,title:w.title,folder:w.folder,monitor_id:m.id,monitor_device:m.device,rect:Rect{left:w.rect.left-m.rect.left,top:w.rect.top-m.rect.top,right:w.rect.right-m.rect.left,bottom:w.rect.bottom-m.rect.top},show:w.show,identity:w.identity});} }
     if out.is_empty(){return Err("Nessuna finestra gestibile trovata: configurazione precedente conservata.".into())}
+    if highlight {let overlay=crate::save_highlight::Overlay::new()?;for (hwnd,identity) in highlighted{
+        if let Some(identity)=identity {let mut pid=0;if unsafe{GetWindowThreadProcessId(hwnd,&mut pid)}==0 || pid!=identity.pid || crate::ipc::process_created(pid)!=Some(identity.created){continue}}
+        overlay.flash(hwnd)?;
+    }}
     fs::create_dir_all(path.parent().ok_or("Cartella del file non valida")?).map_err(|e|e.to_string())?;
     let data=serde_json::to_vec_pretty(&Layout{version:1,windows:out}).map_err(|e|e.to_string())?;
     write_layout(path, &data)?;
@@ -406,6 +419,31 @@ fn write_layout(path: &Path, data: &[u8]) -> Result<(), String> {
         assert_eq!(actual,expected);
     }
     #[test] fn named_layout_writes_selected_file_and_preserves_other_file(){let dir=std::env::temp_dir().join(format!("mydesktop-layout-test-{}-{:?}",std::process::id(),std::thread::current().id()));fs::create_dir(&dir).unwrap();let a=dir.join("first.json");let b=dir.join("second.json");write_layout(&a,b"first").unwrap();write_layout(&b,b"second").unwrap();write_layout(&a,b"updated").unwrap();assert_eq!(fs::read(&a).unwrap(),b"updated");assert_eq!(fs::read(&b).unwrap(),b"second");fs::remove_file(a).unwrap();fs::remove_file(b).unwrap();fs::remove_dir(dir).unwrap();}
+    #[test] #[ignore] fn highlighted_save_keeps_snapshot_and_does_not_move_window(){unsafe{
+        use std::{ffi::c_void,ptr::{null,null_mut},sync::atomic::{AtomicUsize,Ordering}};
+        #[link(name="kernel32")] unsafe extern "system" {fn SetErrorMode(mode:u32)->u32;}
+        static CHANGES:AtomicUsize=AtomicUsize::new(0);
+        unsafe extern "system" fn proc(h:*mut c_void,msg:u32,w:usize,l:isize)->isize{
+            if msg==0x46{CHANGES.fetch_add(1,Ordering::SeqCst);}unsafe{crate::DefWindowProcW(h,msg,w,l)}
+        }
+        struct Cleanup{hwnd:*mut c_void,dir:PathBuf}
+        impl Drop for Cleanup{fn drop(&mut self){unsafe{crate::DestroyWindow(self.hwnd);}
+            let _=fs::remove_file(self.dir.join("default.json"));let _=fs::remove_file(self.dir.join("named.json"));let _=fs::remove_dir(&self.dir);}}
+        SetErrorMode(2);let dir=std::env::temp_dir().join(format!("mydesktop-highlight-save-test-{}",std::process::id()));fs::create_dir(&dir).unwrap();
+        let name=crate::wide("myDesktopHighlightSaveTest");let instance=crate::GetModuleHandleW(null());
+        let class=crate::WndClassW{style:0,wnd_proc:Some(proc),cls_extra:0,wnd_extra:0,instance,icon:null_mut(),cursor:null_mut(),background:null_mut(),menu_name:null(),class_name:name.as_ptr()};assert_ne!(crate::RegisterClassW(&class),0);
+        let hwnd=crate::CreateWindowExW(0x08000080,name.as_ptr(),name.as_ptr(),0x80000000,60,60,220,140,null_mut(),null_mut(),instance,null_mut());
+        let cleanup=Cleanup{hwnd,dir:dir.clone()};assert!(!cleanup.hwnd.is_null());
+        assert_ne!(SetWindowPos(hwnd as isize,-1,60,60,220,140,0x10|0x40),0);
+        let mut r=Rect::default();assert_ne!(GetWindowRect(hwnd as isize,(&mut r as *mut Rect).cast()),0);let monitor=MonitorFromWindow(hwnd as isize,2);
+        let pid=std::process::id();let identity=WindowIdentity{hwnd:hwnd as u64,pid,created:crate::ipc::process_created(pid).unwrap()};
+        let live=Live{hwnd:hwnd as isize,exe:"test.exe".into(),class:"Test".into(),title:"Test".into(),folder:None,monitor,rect:r,show:1,identity:Some(identity)};
+        CHANGES.store(0,Ordering::SeqCst);let started=std::time::Instant::now();
+        save_captured(&dir.join("default.json"),vec![live.clone()],true).unwrap();assert!(started.elapsed()>=Duration::from_millis(200));
+        let mut after=Rect::default();assert_ne!(GetWindowRect(hwnd as isize,(&mut after as *mut Rect).cast()),0);assert_eq!(r,after);assert_eq!(CHANGES.load(Ordering::SeqCst),0);
+        save_captured(&dir.join("named.json"),vec![live],false).unwrap();assert_eq!(fs::read(dir.join("default.json")).unwrap(),fs::read(dir.join("named.json")).unwrap());
+        drop(cleanup);
+    }}
 }
 fn equivalent(a:&str,b:&str)->bool{a.eq_ignore_ascii_case(b)}
 fn mfc_style(class:&str)->Option<&str>{ let mut fields=class.split(':'); if fields.next()? != "Afx" {return None} let instance=fields.next()?; let style=fields.next()?; let cursor=fields.next()?; let background=fields.next()?; let icon=fields.next()?; if fields.next().is_some() || [instance,style,cursor,background,icon].iter().any(|s|s.is_empty() || !s.bytes().all(|c|c.is_ascii_hexdigit())) {return None} Some(style) }

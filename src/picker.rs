@@ -34,6 +34,7 @@ static BORDERS:[AtomicIsize;4]=[const {AtomicIsize::new(0)};4];
 }
 
 unsafe fn root_at(p:Point)->isize {unsafe{let child=WindowFromPoint(p);if child==0{0}else{GetAncestor(child,2)}}}
+#[cfg(test)] pub(crate) unsafe fn test_root_at(x:i32,y:i32)->isize{unsafe{root_at(Point{x,y})}}
 unsafe fn finish(confirm:usize,hwnd:isize){unsafe{
     if FINISH_POSTED.compare_exchange(false,true,Ordering::AcqRel,Ordering::Relaxed).is_ok() &&
        crate::PostMessageW(OWNER.load(Ordering::Relaxed) as Handle,FINISHED,confirm,hwnd)==0 {
