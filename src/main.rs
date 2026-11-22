@@ -219,8 +219,8 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
     if msg != 0 && msg == TASKBAR_CREATED.load(Ordering::Relaxed) {
         Shell_NotifyIconW(NIM_ADD, &mut tray_data(hwnd));
         if BUSY.load(Ordering::Acquire) { spinner::tick(hwnd); }
-        else if error_indicator::active() { error_indicator::draw(hwnd); }
         else if success::active() { success::draw(hwnd); }
+        error_indicator::draw(hwnd);
         return 0;
     }
     match msg {
@@ -305,23 +305,41 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
         save_highlight::SHOW => {save_highlight::show_pending(hwnd);0}
         WM_TIMER if w == save_highlight::TIMER => {save_highlight::tick(hwnd);0}
         WM_TIMER if w == spinner::TIMER_ID => {
-            if BUSY.load(Ordering::Acquire) { spinner::tick(hwnd); } else { spinner::stop(hwnd); if error_indicator::active(){error_indicator::draw(hwnd);} }
+            if BUSY.load(Ordering::Acquire) { spinner::tick(hwnd); } else { spinner::stop(hwnd); if error_indicator::badge_active(){error_indicator::draw(hwnd);} }
             0
         }
-        WM_TIMER if w == error_indicator::TIMER => { if !BUSY.load(Ordering::Acquire) { error_indicator::tick(hwnd); } 0 }
-        WM_TIMER if w == success::TIMER_ID => { if !BUSY.load(Ordering::Acquire) && success::active() && success::expired() { success::stop(hwnd); } 0 }
+        WM_TIMER if w == error_indicator::TIMER => {
+            let busy = BUSY.load(Ordering::Acquire);
+            if error_indicator::tick(hwnd, busy) {
+                if busy { spinner::tick(hwnd); }
+                else if success::active() { success::draw(hwnd); }
+                else {
+                    let mut data = tray_data(hwnd);
+                    data.flags = NIF_ICON;
+                    Shell_NotifyIconW(1, &mut data);
+                }
+            }
+            0
+        }
+        WM_TIMER if w == success::TIMER_ID => {
+            if !BUSY.load(Ordering::Acquire) && success::active() && success::expired() {
+                success::stop(hwnd);
+                if error_indicator::badge_active() { error_indicator::draw(hwnd); }
+            }
+            0
+        }
         JOB_FINISHED => {
             let result = JOB_RESULT.lock().unwrap_or_else(|e| e.into_inner()).take();
             if let Some(result) = result {
                 BUSY.store(false, Ordering::Release);
                 spinner::stop(hwnd);
                 match result {
-                    JobCompletion::Standard(Ok(_)) => if error_indicator::active(){error_indicator::draw(hwnd)}else{success::start(hwnd)},
+                    JobCompletion::Standard(Ok(_)) => if error_indicator::badge_active(){error_indicator::draw(hwnd)}else{success::start(hwnd)},
                     JobCompletion::Standard(Err(message)) => tell(&message, true),
                     JobCompletion::Service { install, result: Err(message) } => { let _=install; tell(&message, true); },
                     JobCompletion::Service { install, result: Ok(()) } => {
                         if let Err(e)=startup::set(install) { tell(&e,true); }
-                        else if error_indicator::active(){error_indicator::draw(hwnd)}else{success::start(hwnd)}
+                        else if error_indicator::badge_active(){error_indicator::draw(hwnd)}else{success::start(hwnd)}
                     }
                 }
             }
@@ -331,7 +349,7 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
             if !picker::active(){return 0}
             picker::stop(hwnd);
             if w==1 && l!=0 {apply_to_selected_window(hwnd,l,PICKER_ACTION.with(std::cell::Cell::get))} else {
-                BUSY.store(false,Ordering::Release);spinner::stop(hwnd);if error_indicator::active(){error_indicator::draw(hwnd);}
+                BUSY.store(false,Ordering::Release);spinner::stop(hwnd);if error_indicator::badge_active(){error_indicator::draw(hwnd);}
             }
             0
         }

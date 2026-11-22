@@ -22,6 +22,15 @@ impl Popup {
         unsafe { crate::AppendMenuW(self.0, flags, id, text.as_ptr()) != 0 }
     }
 
+    fn append_window(&self, index: usize, label: &str) -> Option<()> {
+        let id = FIRST_WINDOW_COMMAND.checked_add(u32::try_from(index).ok()?)?;
+        if id > u32::from(u16::MAX) {
+            return None;
+        }
+        self.append(MF_STRING, id as usize, &menu_label(label))
+            .then_some(())
+    }
+
     fn attach(self, parent: Handle, label: &str) -> bool {
         let text = crate::wide(label);
         if unsafe { crate::AppendMenuW(parent, MF_POPUP, self.0 as usize, text.as_ptr()) } == 0 {
@@ -64,14 +73,13 @@ pub fn append_to(parent: Handle) -> Option<core::Layout> {
         match &layout {
             Ok(layout) => {
                 for group in layout.groups() {
+                    if let [(index, title)] = group.windows.as_slice() {
+                        list.append_window(*index, &format!("{} — {title}", group.program))?;
+                        continue;
+                    }
                     let program = Popup::new()?;
                     for (index, title) in group.windows {
-                        let id = FIRST_WINDOW_COMMAND.checked_add(u32::try_from(index).ok()?)?;
-                        if id > u32::from(u16::MAX)
-                            || !program.append(MF_STRING, id as usize, &menu_label(&title))
-                        {
-                            return None;
-                        }
+                        program.append_window(index, &title)?;
                     }
                     if !program.attach(list.0, &menu_label(&group.program)) {
                         return None;
