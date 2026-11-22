@@ -7,6 +7,7 @@ mod explorer;
 mod ipc;
 mod menu_help;
 mod picker;
+mod restore_menu;
 mod save_highlight;
 mod protected;
 mod spinner;
@@ -44,6 +45,7 @@ const MF_STRING: u32 = 0;
 const MF_SEPARATOR: u32 = 0x800;
 const MF_CHECKED: u32 = 0x8;
 const TOGGLE_SAVE_HIGHLIGHT: u32 = 11;
+const PICK_RESTORE_WINDOW: u32 = 12;
 const TPM_RIGHTBUTTON: u32 = 2;
 const TPM_RETURNCMD: u32 = 0x100;
 const ERROR_ALREADY_EXISTS: u32 = 183;
@@ -52,6 +54,11 @@ static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 static TRAY_WINDOW: AtomicIsize = AtomicIsize::new(0);
 enum JobCompletion { Standard(Result<String, String>), Service { install: bool, result: Result<(), String> } }
 static JOB_RESULT: Mutex<Option<JobCompletion>> = Mutex::new(None);
+#[derive(Clone, Copy)]
+enum PickerAction { Save, Restore }
+thread_local! {
+    static PICKER_ACTION: std::cell::Cell<PickerAction> = const { std::cell::Cell::new(PickerAction::Save) };
+}
 
 #[repr(C)]
 struct WndClassW {
@@ -125,13 +132,18 @@ unsafe fn tray_data(hwnd: Handle) -> NotifyIconDataW {
     for (out, ch) in data.tip.iter_mut().zip(wide("myDesktop - configurazione finestre")) { *out = ch; }
     data
 }
-fn start_job(hwnd: Handle, save: bool, path: Option<std::path::PathBuf>, mode:core::RestoreMode) {
-    if BUSY.swap(true, Ordering::AcqRel) { tell("Un'operazione è già in corso. Attendi il completamento.", true); return; }
+fn begin_standard_job(hwnd: Handle) -> bool {
+    if BUSY.swap(true, Ordering::AcqRel) {
+        tell("Un'operazione è già in corso. Attendi il completamento.", true);
+        return false;
+    }
     unsafe { success::stop(hwnd); spinner::start(hwnd); }
+    true
+}
+fn spawn_standard_job(hwnd: Handle, operation: impl FnOnce() -> Result<String, String> + Send + 'static) {
     let target = hwnd as usize;
-    let highlight_owner = save_highlight::enabled().then_some(target as isize);
     let started = std::thread::Builder::new().spawn(move || {
-        let outcome = std::panic::catch_unwind(|| match (save, path.as_deref(),mode) { (true, Some(path),_) => core::save_to(path), (true, None,_) => core::save(highlight_owner), (false, Some(path),core::RestoreMode::Normal) => core::restore_from(path), (false,None,core::RestoreMode::Normal)=>core::restore(), (false,Some(path),mode)=>core::restore_from_mode(path,mode), (false,None,mode)=>core::restore_mode(mode) });
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
         let result = JobCompletion::Standard(match outcome { Ok(result) => result, Err(_) => Err("Errore inatteso durante l'operazione.".into()) });
         *JOB_RESULT.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
         if unsafe { PostMessageW(target as Handle, JOB_FINISHED, 0, 0) } == 0 {
@@ -144,24 +156,33 @@ fn start_job(hwnd: Handle, save: bool, path: Option<std::path::PathBuf>, mode:co
         tell(&format!("Impossibile avviare l'operazione: {e}"), true);
     }
 }
-fn begin_single_selection(hwnd:Handle){
-    if BUSY.swap(true,Ordering::AcqRel){tell("Un'operazione è già in corso. Attendi il completamento.",true);return}
-    unsafe {success::stop(hwnd);spinner::start(hwnd);}
+fn start_job(hwnd: Handle, save: bool, path: Option<std::path::PathBuf>, mode: core::RestoreMode) {
+    if !begin_standard_job(hwnd) { return; }
+    let highlight_owner = save_highlight::enabled().then_some(hwnd as isize);
+    spawn_standard_job(hwnd, move || match (save, path.as_deref(), mode) {
+        (true, Some(path), _) => core::save_to(path),
+        (true, None, _) => core::save(highlight_owner),
+        (false, Some(path), core::RestoreMode::Normal) => core::restore_from(path),
+        (false, None, core::RestoreMode::Normal) => core::restore(),
+        (false, Some(path), mode) => core::restore_from_mode(path, mode),
+        (false, None, mode) => core::restore_mode(mode),
+    });
+}
+fn begin_single_selection(hwnd: Handle, action: PickerAction) {
+    if !begin_standard_job(hwnd) { return; }
+    PICKER_ACTION.with(|current| current.set(action));
     if let Err(error)=unsafe{picker::begin(hwnd)} {
         BUSY.store(false,Ordering::Release);unsafe{spinner::stop(hwnd);}tell(&error,true);
     }
 }
-fn save_selected_window(hwnd:Handle,selected:isize){
+fn apply_to_selected_window(hwnd: Handle, selected: isize, action: PickerAction) {
     let token=match core::selection_token(selected){Ok(token)=>token,Err(error)=>{
         BUSY.store(false,Ordering::Release);unsafe{spinner::stop(hwnd);}tell(&error,true);return
     }};
-    let target=hwnd as usize;
-    let started=std::thread::Builder::new().spawn(move||{
-        let result=std::panic::catch_unwind(||core::save_one(selected,token)).unwrap_or_else(|_|Err("Errore inatteso durante la memorizzazione della finestra.".into()));
-        *JOB_RESULT.lock().unwrap_or_else(|e|e.into_inner())=Some(JobCompletion::Standard(result));
-        if unsafe{PostMessageW(target as Handle,JOB_FINISHED,0,0)}==0{BUSY.store(false,Ordering::Release);}
+    spawn_standard_job(hwnd, move || match action {
+        PickerAction::Save => core::save_one(selected, token),
+        PickerAction::Restore => core::restore_selected_window(selected, token),
     });
-    if let Err(error)=started{BUSY.store(false,Ordering::Release);unsafe{spinner::stop(hwnd);}tell(&format!("Impossibile avviare la memorizzazione: {error}"),true);}
 }
 fn start_service_change(hwnd: Handle, install: bool) {
     if BUSY.swap(true, Ordering::AcqRel) { tell("Un'operazione è già in corso. Attendi il completamento.", true); return; }
@@ -209,6 +230,8 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
                 AppendMenuW(menu, MF_STRING, 1, wide("Memorizza finestre").as_ptr());
                 AppendMenuW(menu, MF_STRING, 10, wide("Memorizza una finestra...").as_ptr());
                 AppendMenuW(menu, MF_STRING, 2, wide("Ripristina finestre").as_ptr());
+                AppendMenuW(menu, MF_STRING, PICK_RESTORE_WINDOW as usize, wide("Ripristina finestra...").as_ptr());
+                let listed_layout = restore_menu::append_to(menu);
                 AppendMenuW(menu, MF_STRING, 8, wide("Ripristina finestre (solo presenti)").as_ptr());
                 AppendMenuW(menu, MF_STRING, 9, wide("Ripristina finestre (chiudi estranee)").as_ptr());
                 AppendMenuW(menu, MF_STRING, 6, wide("Memorizza finestre come...").as_ptr());
@@ -229,7 +252,8 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
                 menu_help::hide(hwnd); DestroyMenu(menu); PostMessageW(hwnd, 0, 0, 0);
                 match command {
                     1 => start_job(hwnd, true, None,core::RestoreMode::Normal),
-                    10 => begin_single_selection(hwnd),
+                    10 => begin_single_selection(hwnd, PickerAction::Save),
+                    PICK_RESTORE_WINDOW => begin_single_selection(hwnd, PickerAction::Restore),
                     TOGGLE_SAVE_HIGHLIGHT => {
                         if let Err(error) = save_highlight::toggle_preference() {
                             tell(&error, true);
@@ -257,7 +281,13 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
                     3 if picker::active() => {picker::stop(hwnd);BUSY.store(false,Ordering::Release);DestroyWindow(hwnd);},
                     3 if !BUSY.load(Ordering::Acquire) => { DestroyWindow(hwnd); },
                     3 => tell("Attendi il completamento dell'operazione prima di uscire.", true),
-                    _ => ()
+                    _ => {
+                        if let (Some(layout), Some(index)) = (listed_layout, restore_menu::window_index(command)) {
+                            if begin_standard_job(hwnd) {
+                                spawn_standard_job(hwnd, move || core::restore_saved_window(layout, index));
+                            }
+                        }
+                    }
                 }
             }
             0
@@ -300,7 +330,7 @@ unsafe extern "system" fn wnd_proc(hwnd: Handle, msg: u32, w: Wparam, l: Lparam)
         picker::FINISHED => {
             if !picker::active(){return 0}
             picker::stop(hwnd);
-            if w==1 && l!=0 {save_selected_window(hwnd,l)} else {
+            if w==1 && l!=0 {apply_to_selected_window(hwnd,l,PICKER_ACTION.with(std::cell::Cell::get))} else {
                 BUSY.store(false,Ordering::Release);spinner::stop(hwnd);if error_indicator::active(){error_indicator::draw(hwnd);}
             }
             0
